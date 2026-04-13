@@ -1,4 +1,84 @@
-# BCR Dataset — Audit Findings
+## EEGDenoiseNet
+
+- **Path**: `data/raw/eegdenoisenet/data/`
+- **Source**: https://github.com/ncclabsustech/EEGdenoiseNet
+- **Paper**: Zhang et al. 2021, arXiv:2009.11662v4
+- **NaNs**: 0 across all arrays
+
+### Array details
+
+| Array                  | Shape         | Rate   | Duration | Role                        |
+|------------------------|---------------|--------|----------|-----------------------------|
+| EEG_all_epochs         | (4514, 512)   | 256 Hz | 2s       | Clean ground truth          |
+| EOG_all_epochs         | (3400, 512)   | 256 Hz | 2s       | Ocular artifact             |
+| EMG_all_epochs         | (5598, 512)   | 512 Hz | 1s       | Muscle artifact (DO NOT USE for synthesis) |
+| EEG_all_epochs_512hz   | (4514, 1024)  | 512 Hz | 2s       | Clean EEG upsampled for EMG mixing |
+| EMG_all_epochs_512hz   | (5598, 1024)  | 512 Hz | 2s       | Muscle artifact for correct synthesis |
+
+### Normalisation status
+Data is NOT pre-normalised despite paper claim of standardisation.
+Confirmed by cell 3 output (02_denoiser_eda.ipynb):
+- EEG_all_epochs mean epoch std    : 218.83 µV, range 63.23 – 502.78 µV
+- EEG_all_epochs_512hz mean std    : ~228.55 µV (same data, upsampled)
+- EMG_all_epochs_512hz mean std    : ~40,618 µV (~178x larger than EEG)
+- Data appears normalised          : False
+
+z-score must be applied per-epoch in dataset.py before feeding to model.
+Per paper Equation 4: divide both noisy input AND clean target by std(noisy).
+Save std value per epoch to recover real amplitude after inference.
+
+### EOG synthesis — confirmed correct
+mix_snr() with per-epoch RMS power matching at SNR=0 dB is correct for EOG.
+Both EEG and EOG are at 256 Hz, same duration — no preprocessing needed.
+
+Confirmed visually (denoiser_eog_pairs.png):
+- Epoch 3839: moderate slow-wave contamination, amplitude ~±500 µV
+- Epoch 2307: strong EOG burst, amplitude reaches ±1000 µV
+- Epoch 1389: subtle contamination, noisy signal slightly larger than clean
+
+Confirmed in PSD (denoiser_psd_comparison.png):
+- EOG elevated ~1 order of magnitude below 5 Hz vs clean EEG
+- EOG and clean overlap above 10 Hz — low-frequency contamination only
+- Hard cutoff at 80 Hz preserved (pre-filtered in source data, paper Section 2.1)
+- Alpha peak ~10 Hz visible in clean EEG — genuine resting-state data confirmed
+
+### EMG synthesis — confirmed correct using 512 Hz files
+The 256 Hz EMG_all_epochs.npy must NOT be used for synthesis — epoch length
+mismatch (1s EMG vs 2s EEG) makes all synthesis approaches produce incorrect
+spectral profiles. This was exhaustively verified in Day 4 EDA.
+
+Solution: authors published pre-upsampled 512 Hz arrays which resolve the
+mismatch entirely. Both EEG_all_epochs_512hz and EMG_all_epochs_512hz are
+1024 samples at 512 Hz = 2 seconds. Direct mixing is valid.
+
+Correct synthesis procedure (confirmed in Day 4, to be implemented Day 17):
+1. Load EEG_all_epochs_512hz (4514, 1024) and EMG_all_epochs_512hz (5598, 1024)
+2. Mix directly with mix_snr() — same shape, same rate, same duration
+3. Downsample noisy result 512 Hz → 256 Hz via resample_poly(up=1, down=2)
+4. Use EEG_all_epochs (256 Hz) as clean training target
+5. Training pair: (512-sample noisy, 512-sample clean) = 2s at 256 Hz
+Full 2-second epochs preserved — identical duration to EOG training pairs.
+
+Confirmed visually (denoiser_emg_pairs.png):
+- No boundary spikes or discontinuities
+- Noisy signal consistently larger amplitude than clean across all epochs
+- High-frequency jitter clearly visible — denser, more jagged texture than clean
+
+Confirmed in PSD (denoiser_psd_comparison.png):
+- EMG curve elevated above clean across full 0–128 Hz range
+- EMG does NOT drop off at 80 Hz — stays elevated to 128 Hz
+- Separation between EMG and clean/EOG larger above 40 Hz than below
+- Confirms genuine broadband high-frequency muscle artifact character
+- Flat profile above 80 Hz is a Nyquist constraint at 256 Hz, not a bug
+
+### Single-channel constraint
+EEGDenoiseNet has no electrode montage. BCR requires spatial features across
+multiple channels (spatial correlation, impedance across montage, multi-channel
+variance comparisons). These cannot be computed from single-channel data.
+BCR and denoiser are therefore validated independently on separate datasets.
+
+Joint evaluation candidate for future work: PhysioNet EEG-MMI (109 subjects,
+64 ch, 10-20 montage). Documented in report/future_work_draft.md.# BCR Dataset — Audit Findings
 
 ## Basic statistics
 - Total rows: 18,900 (channels × sessions)
@@ -97,3 +177,85 @@
 - BCR and denoiser are validated independently on separate datasets
 - BCR requires spatial features (multi-channel); EEGDenoiseNet is single-channel
 - Joint pipeline evaluation is future work (candidate dataset: PhysioNet EEG-MMI)
+
+## EEGDenoiseNet
+
+- **Path**: `data/raw/eegdenoisenet/data/`
+- **Source**: https://github.com/ncclabsustech/EEGdenoiseNet
+- **Paper**: Zhang et al. 2021, arXiv:2009.11662v4
+- **NaNs**: 0 across all arrays
+
+### Array details
+
+| Array                  | Shape         | Rate   | Duration | Role                        |
+|------------------------|---------------|--------|----------|-----------------------------|
+| EEG_all_epochs         | (4514, 512)   | 256 Hz | 2s       | Clean ground truth          |
+| EOG_all_epochs         | (3400, 512)   | 256 Hz | 2s       | Ocular artifact             |
+| EMG_all_epochs         | (5598, 512)   | 512 Hz | 1s       | Muscle artifact (DO NOT USE for synthesis) |
+| EEG_all_epochs_512hz   | (4514, 1024)  | 512 Hz | 2s       | Clean EEG upsampled for EMG mixing |
+| EMG_all_epochs_512hz   | (5598, 1024)  | 512 Hz | 2s       | Muscle artifact for correct synthesis |
+
+### Normalisation status
+Data is NOT pre-normalised despite paper claim of standardisation.
+Confirmed by cell 3 output (02_denoiser_eda.ipynb):
+- EEG_all_epochs mean epoch std    : 218.83 µV, range 63.23 – 502.78 µV
+- EEG_all_epochs_512hz mean std    : ~228.55 µV (same data, upsampled)
+- EMG_all_epochs_512hz mean std    : ~40,618 µV (~178x larger than EEG)
+- Data appears normalised          : False
+
+z-score must be applied per-epoch in dataset.py before feeding to model.
+Per paper Equation 4: divide both noisy input AND clean target by std(noisy).
+Save std value per epoch to recover real amplitude after inference.
+
+### EOG synthesis — confirmed correct
+mix_snr() with per-epoch RMS power matching at SNR=0 dB is correct for EOG.
+Both EEG and EOG are at 256 Hz, same duration — no preprocessing needed.
+
+Confirmed visually (denoiser_eog_pairs.png):
+- Epoch 3839: moderate slow-wave contamination, amplitude ~±500 µV
+- Epoch 2307: strong EOG burst, amplitude reaches ±1000 µV
+- Epoch 1389: subtle contamination, noisy signal slightly larger than clean
+
+Confirmed in PSD (denoiser_psd_comparison.png):
+- EOG elevated ~1 order of magnitude below 5 Hz vs clean EEG
+- EOG and clean overlap above 10 Hz — low-frequency contamination only
+- Hard cutoff at 80 Hz preserved (pre-filtered in source data, paper Section 2.1)
+- Alpha peak ~10 Hz visible in clean EEG — genuine resting-state data confirmed
+
+### EMG synthesis — confirmed correct using 512 Hz files
+The 256 Hz EMG_all_epochs.npy must NOT be used for synthesis — epoch length
+mismatch (1s EMG vs 2s EEG) makes all synthesis approaches produce incorrect
+spectral profiles. This was exhaustively verified in Day 4 EDA.
+
+Solution: authors published pre-upsampled 512 Hz arrays which resolve the
+mismatch entirely. Both EEG_all_epochs_512hz and EMG_all_epochs_512hz are
+1024 samples at 512 Hz = 2 seconds. Direct mixing is valid.
+
+Correct synthesis procedure (confirmed in Day 4, to be implemented Day 17):
+1. Load EEG_all_epochs_512hz (4514, 1024) and EMG_all_epochs_512hz (5598, 1024)
+2. Mix directly with mix_snr() — same shape, same rate, same duration
+3. Downsample noisy result 512 Hz → 256 Hz via resample_poly(up=1, down=2)
+4. Use EEG_all_epochs (256 Hz) as clean training target
+5. Training pair: (512-sample noisy, 512-sample clean) = 2s at 256 Hz
+Full 2-second epochs preserved — identical duration to EOG training pairs.
+
+Confirmed visually (denoiser_emg_pairs.png):
+- No boundary spikes or discontinuities
+- Noisy signal consistently larger amplitude than clean across all epochs
+- High-frequency jitter clearly visible — denser, more jagged texture than clean
+
+Confirmed in PSD (denoiser_psd_comparison.png):
+- EMG curve elevated above clean across full 0–128 Hz range
+- EMG does NOT drop off at 80 Hz — stays elevated to 128 Hz
+- Separation between EMG and clean/EOG larger above 40 Hz than below
+- Confirms genuine broadband high-frequency muscle artifact character
+- Flat profile above 80 Hz is a Nyquist constraint at 256 Hz, not a bug
+
+### Single-channel constraint
+EEGDenoiseNet has no electrode montage. BCR requires spatial features across
+multiple channels (spatial correlation, impedance across montage, multi-channel
+variance comparisons). These cannot be computed from single-channel data.
+BCR and denoiser are therefore validated independently on separate datasets.
+
+Joint evaluation candidate for future work: PhysioNet EEG-MMI (109 subjects,
+64 ch, 10-20 montage). Documented in report/future_work_draft.md.
