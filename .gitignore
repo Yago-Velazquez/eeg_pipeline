@@ -1,0 +1,23 @@
+# Data (large files — use DVC)
+data/raw/
+*.h5
+*.hdf5
+*.mat
+*.pkl
+
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.DS_Store
+
+# Results (large outputs)
+results/*.json
+results/figures/
+
+# Conda
+*.egg-info/
+dist/
+build/

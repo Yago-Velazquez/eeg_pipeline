@@ -1,0 +1,20 @@
+# EEG Pipeline — base config
+# Last updated: Day 2 (scaffold)
+
+# Preprocessing
+fs: 256
+window: 512
+overlap: 0.5
+
+# BCR
+bad_score_threshold: 2
+primary_metric: 'auprc'
+bcr_threshold: 0.5          # to be tuned on Day 11
+
+# Denoiser
+denoiser_model: 'unet'      # or 'conformer' if Day 26 go/no-go passes
+
+# Paths
+data_raw: 'data/raw'
+results_dir: 'results'
+report_dir: 'report'
