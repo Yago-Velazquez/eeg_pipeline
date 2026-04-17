@@ -1,20 +1,56 @@
-# EEG Pipeline — base config
-# Last updated: Day 2 (scaffold)
+# ─────────────────────────────────────────────────────────────────────
+# EEG Pipeline — Master Config
+# Version: Day 6 finalised
+# ─────────────────────────────────────────────────────────────────────
 
-# Preprocessing
-fs: 256
-window: 512
-overlap: 0.5
+project:
+  name: "eeg_pipeline"
+  version: "0.1"
+  seed: 42
 
-# BCR
-bad_score_threshold: 2
-primary_metric: 'auprc'
-bcr_threshold: 0.5          # to be tuned on Day 11
+data:
+  bcr_csv:         "data/raw/Bad_channels_for_ML.csv"
+  eegdenoise_dir:  "data/raw/eegdenoisenet/data"
 
-# Denoiser
-denoiser_model: 'unet'      # or 'conformer' if Day 26 go/no-go passes
+preprocessing:
+  fs:          512        # canonical sampling rate (Hz); pass explicitly to all functions
+  fs_target:   256        # denoiser inference rate after downsampling
+  bandpass_low:  1.0      # Hz
+  bandpass_high: 40.0
+  notch_freq:    50.0     # Hz — European mains; change to 60.0 for NA data
+  window:        1024     # samples at 512 Hz = 2 s epoch
+  overlap:       0.5
 
-# Paths
-data_raw: 'data/raw'
-results_dir: 'results'
-report_dir: 'report'
+bcr:
+  bad_score_threshold:  2     # Bad if score >= 2 (at least 2 of 4 raters)
+  scale_pos_weight:     24.8  # 18168 / 732; set in XGBClassifier
+  n_splits:             5     # GroupKFold — groups = subject_id (43 unique)
+  decision_threshold:   0.5   # placeholder; updated by best_f1_threshold() on Day 10
+  primary_metric:       "auprc"
+  random_baseline_auprc: 0.039
+  mvs_auprc_target:     0.55
+
+denoiser:
+  window:       512      # samples at 256 Hz = 2 s — denoiser input length
+  overlap:      0.5
+  batch_size:   32
+  fs:           256      # sampling rate passed to rrmse_spectral (Welch PSD)
+  primary_metric: "delta_snr_db"
+  mvs_delta_snr:  8.0    # dB
+  mvs_pearson_r:  0.85
+  secondary_metrics: ["pearson_r", "rrmse_temporal", "rrmse_spectral", "ssim"]
+
+training:
+  early_stopping_patience: 10
+  checkpoint_interval:     5   # epochs — upload to Drive every N epochs (Colab safety)
+  grad_clip_max_norm:      1.0
+
+wandb:
+  project: "eeg_pipeline"
+  entity:  null           # set to your W&B username or leave null for default
+
+paths:
+  results:    "results/"
+  figures:    "results/figures/"
+  models:     "results/models/"
+  reports:    "report/"
