@@ -117,16 +117,19 @@ def impute_and_encode_channels(df: pd.DataFrame,
     return df, imp
 
 
-def build_targets_and_groups(df: pd.DataFrame):
+def build_targets_and_groups(df: pd.DataFrame,
+                              bad_threshold: int = 2):
     """Return y (binary), groups (subject_id), scale_pos_weight."""
-    y = (df['Bad (score)'] >= 2).astype(int)
+    y = (df['Bad (score)'] >= bad_threshold).astype(int)
 
     n_neg = (y == 0).sum()
     n_pos = (y == 1).sum()
     scale_pos_weight = n_neg / n_pos
 
-    print(f"\nClass distribution — good: {n_neg}, bad: {n_pos}")
-    print(f"scale_pos_weight = {scale_pos_weight:.2f}")  # expect ~24.8
+    print(f"\nLabel threshold: Bad (score) >= {bad_threshold}")
+    print(f"Class distribution — good: {n_neg}, bad: {n_pos}")
+    print(f"Bad rate: {n_pos / (n_neg + n_pos):.4f}")
+    print(f"scale_pos_weight = {scale_pos_weight:.2f}")
 
     groups = df['subject_id'].values
     assert len(np.unique(groups)) == 43, \
@@ -136,16 +139,26 @@ def build_targets_and_groups(df: pd.DataFrame):
 
 
 def build_feature_matrix(csv_path: str,
-                          save_cols_to: str = None):
+                          save_cols_to: str = None,
+                          bad_threshold: int = 2):
     """
     Full BCR feature matrix pipeline.
 
-    Returns:
-        X                — np.ndarray (18900, n_features)
-        y                — np.ndarray (18900,) binary labels
-        groups           — np.ndarray (18900,) subject_id for GroupKFold
-        feature_cols     — list of feature column names
-        scale_pos_weight — float ≈ 24.8
+    Parameters
+    ----------
+    csv_path      : path to Bad_channels_for_ML.csv
+    save_cols_to  : optional path to save feature column names as JSON
+    bad_threshold : minimum Bad (score) to label a channel as bad.
+                    2 = score>=2 (3.9% bad, scale_pos_weight~24.8)  ← default
+                    1 = score>=1 (12.8% bad, scale_pos_weight~6.8)  ← sensitivity experiment
+
+    Returns
+    -------
+    X                — np.ndarray (18900, n_features)
+    y                — np.ndarray (18900,) binary labels
+    groups           — np.ndarray (18900,) subject_id for GroupKFold
+    feature_cols     — list of feature column names
+    scale_pos_weight — float
     """
     df = load_bcr_data(csv_path)
 
@@ -166,7 +179,7 @@ def build_feature_matrix(csv_path: str,
     feature_cols = feature_cols + ['channel_label_enc']
 
     # Step 4: targets + groups
-    y, groups, scale_pos_weight = build_targets_and_groups(df)
+    y, groups, scale_pos_weight = build_targets_and_groups(df, bad_threshold)
 
     X = df[feature_cols].values
     assert X.shape[0] == 18900, f"Expected 18900 rows, got {X.shape[0]}"
