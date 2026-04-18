@@ -25,7 +25,7 @@ bcr:
   bad_score_threshold:  2     # Bad if score >= 2 (at least 2 of 4 raters)
   scale_pos_weight:     24.8  # 18168 / 732; set in XGBClassifier
   n_splits:             5     # GroupKFold — groups = subject_id (43 unique)
-  decision_threshold:   0.5   # placeholder; updated by best_f1_threshold() on Day 10
+  decision_threshold: 0.6044
   primary_metric:       "auprc"
   random_baseline_auprc: 0.039
   mvs_auprc_target:     0.55
