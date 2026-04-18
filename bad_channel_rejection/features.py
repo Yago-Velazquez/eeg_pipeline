@@ -165,10 +165,11 @@ class FeaturePreprocessor:
 
         # 3. RobustScaler — fit on train only
         if fit:
-            X_cont_scaled = self.scaler.fit_transform(X_cont)
+            X_cont_scaled = self.scaler.fit_transform(X_cont) if X_cont.shape[1] > 0 else X_cont
             self.feature_names_in_ = cont_cols + binary_present
         else:
-            X_cont_scaled = self.scaler.transform(X_cont)
+            X_cont_scaled = self.scaler.transform(X_cont) if X_cont.shape[1] > 0 else X_cont
+
 
         # 4. Recombine scaled continuous + unscaled binary
         X_scaled    = np.hstack([X_cont_scaled, X_binary.to_numpy()])
