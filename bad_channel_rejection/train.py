@@ -7,6 +7,7 @@ Run:
     python -m bad_channel_rejection.train --threshold 1
 """
 
+
 import argparse
 import json
 import logging
@@ -31,6 +32,10 @@ from bad_channel_rejection.dataset import build_feature_matrix
 from bad_channel_rejection.features import FeaturePreprocessor
 
 load_dotenv()
+
+# Force W&B offline — avoids network timeout on restricted connections
+import os
+os.environ["WANDB_MODE"] = "offline"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -109,10 +114,21 @@ def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
 # ── Cross-validation loop ─────────────────────────────────────────────────────
 
 def run_cv(X: np.ndarray, y: np.ndarray, groups: np.ndarray,
-           spw: float) -> list[dict]:
-    """5-fold GroupKFold CV. Returns list of per-fold metric dicts."""
+           spw: float, bad_threshold: int) -> tuple[list[dict], np.ndarray, np.ndarray]:
+    """5-fold GroupKFold CV.
+
+    Returns
+    -------
+    fold_metrics  : list of per-fold metric dicts
+    oof_y_true    : np.ndarray (18900,) — ground truth in OOF order
+    oof_y_prob    : np.ndarray (18900,) — predicted probabilities in OOF order
+    """
     cv = GroupKFold(n_splits=N_SPLITS)
     fold_metrics = []
+
+    # Pre-allocate OOF arrays in original row order
+    oof_y_true = np.empty(len(y), dtype=int)
+    oof_y_prob = np.empty(len(y), dtype=float)
 
     for fold, (tr_idx, va_idx) in enumerate(cv.split(X, y, groups), start=1):
         X_tr, X_va = X[tr_idx], X[va_idx]
@@ -135,6 +151,11 @@ def run_cv(X: np.ndarray, y: np.ndarray, groups: np.ndarray,
         )
 
         y_prob = model.predict_proba(X_va)[:, 1]
+
+        # Store OOF predictions at the original row indices
+        oof_y_true[va_idx] = y_va
+        oof_y_prob[va_idx] = y_prob
+
         m = compute_metrics(y_va, y_prob)
         m["fold"]         = fold
         m["best_iter"]    = int(model.best_iteration)
@@ -148,7 +169,15 @@ def run_cv(X: np.ndarray, y: np.ndarray, groups: np.ndarray,
             f"val_bad_rate={m['val_bad_rate']:.4f}"
         )
 
-    return fold_metrics
+    # Save OOF predictions to disk so evaluate.py can load them directly
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    oof_true_path = MODEL_DIR / f"oof_y_true_thresh{bad_threshold}.npy"
+    oof_prob_path = MODEL_DIR / f"oof_y_prob_thresh{bad_threshold}.npy"
+    np.save(str(oof_true_path), oof_y_true)
+    np.save(str(oof_prob_path), oof_y_prob)
+    logger.info(f"OOF predictions saved → {oof_true_path}, {oof_prob_path}")
+
+    return fold_metrics, oof_y_true, oof_y_prob
 
 
 # ── Summary ────────────────────────────────────────────────────────────────────
@@ -225,6 +254,7 @@ def train_with_wandb(bad_threshold: int = 2):
             "n_splits":      N_SPLITS,
             "random_seed":   RANDOM_SEED,
         },
+        settings=wandb.Settings(init_timeout=120),
     )
 
     # Load data
@@ -238,8 +268,8 @@ def train_with_wandb(bad_threshold: int = 2):
         "n_good":           int((y == 0).sum()),
     })
 
-    # Cross-validation
-    fold_metrics = run_cv(X, y, groups, spw)
+    # Cross-validation — also saves OOF predictions to results/
+    fold_metrics, oof_y_true, oof_y_prob = run_cv(X, y, groups, spw, bad_threshold)
 
     # Log per-fold metrics to W&B
     for m in fold_metrics:
