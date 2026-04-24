@@ -2,36 +2,29 @@
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-.Python
-*.egg-info/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# Environments
+.env
+*.egg-info/
 
-# W&B artifacts (offline runs)
+# W&B and CatBoost logs
 wandb/
+catboost_info/
 
-# Training artifacts (regenerable, large)
+# Data (don't commit the raw CSV or npy arrays)
+data/raw/
 results/oof_*.npy
-results/bcr_model_*.pkl
 results/bcr_model_*.json
-results/bcr_model_*.cbm
+results/bcr_model_*.pkl
 results/bcr_model_*_meta.json
-results/figures/*.png
 
-# Logs
-logs/
-*.log
+# Notebook checkpoints
+.ipynb_checkpoints/
 
-# OS / IDE
+# OS
 .DS_Store
-Thumbs.db
-.vscode/
-.idea/
-*.swp
+
+# Temporary scratch
+Temporary/
+notes/
