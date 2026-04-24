@@ -1,0 +1,79 @@
+{
+  "stage1": {
+    "conditions": {
+      "A": {
+        "label": "S1_A_hard_threshold",
+        "auprc_mean": 0.5180480588095842,
+        "auprc_std": 0.07603214888130162,
+        "auroc_mean": 0.9205763762366649,
+        "auroc_std": 0.011159585677157635,
+        "condition_id": "A",
+        "strategy": "hard_threshold",
+        "description": "score>=2, uniform weights (baseline)"
+      },
+      "B": {
+        "label": "S1_B_entropy_weights",
+        "auprc_mean": 0.5172480642115577,
+        "auprc_std": 0.1011387481581113,
+        "auroc_mean": 0.9115590286302844,
+        "auroc_std": 0.00868876799332491,
+        "condition_id": "B",
+        "strategy": "entropy_weights",
+        "description": "score>=2, entropy-derived weights"
+      },
+      "C": {
+        "label": "S1_C_dawid_skene",
+        "auprc_mean": 0.5217545296697634,
+        "auprc_std": 0.08547621843294625,
+        "auroc_mean": 0.922842321771751,
+        "auroc_std": 0.01250765197972299,
+        "condition_id": "C",
+        "strategy": "dawid_skene",
+        "description": "q>=0.5 hard + |q-0.5|*2 weights"
+      },
+      "D": {
+        "label": "S1_D_dawid_skene_soft",
+        "auprc_mean": 0.5178046716937821,
+        "auprc_std": 0.08062832219113567,
+        "auroc_mean": 0.9215103893999664,
+        "auroc_std": 0.012617367452248576,
+        "condition_id": "D",
+        "strategy": "dawid_skene_soft",
+        "description": "q>=0.5 hard + full-confidence weights"
+      }
+    },
+    "winner_condition_id": "C",
+    "winner_strategy": "dawid_skene",
+    "baseline_auprc": 0.5180480588095842
+  },
+  "stage2": {
+    "conditions": {
+      "xgboost": {
+        "label": "S2_xgboost",
+        "auprc_mean": 0.5217545296697634,
+        "auprc_std": 0.08547621843294625,
+        "auroc_mean": 0.922842321771751,
+        "auroc_std": 0.01250765197972299,
+        "model": "xgboost"
+      },
+      "lightgbm": {
+        "label": "S2_lightgbm",
+        "auprc_mean": 0.5261075425425688,
+        "auprc_std": 0.08790456380035988,
+        "auroc_mean": 0.9231023972220566,
+        "auroc_std": 0.010070894470871321,
+        "model": "lightgbm"
+      },
+      "catboost": {
+        "label": "S2_catboost",
+        "auprc_mean": 0.5184115373029423,
+        "auprc_std": 0.0844038754128529,
+        "auroc_mean": 0.92628805068921,
+        "auroc_std": 0.010574768622687055,
+        "model": "catboost"
+      }
+    },
+    "winner_model": "lightgbm",
+    "xgboost_baseline_auprc": 0.5217545296697634
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "label_strategy": "dawid_skene",
+  "model_name": "lightgbm",
+  "per_visit": [
+    {
+      "test_visit": 1,
+      "n_train": 15120,
+      "n_test": 3780,
+      "bad_rate_test": 0.0331,
+      "auprc": 0.4522,
+      "auroc": 0.9046
+    },
+    {
+      "test_visit": 2,
+      "n_train": 15120,
+      "n_test": 3780,
+      "bad_rate_test": 0.0489,
+      "auprc": 0.5952,
+      "auroc": 0.926
+    },
+    {
+      "test_visit": 3,
+      "n_train": 11340,
+      "n_test": 7560,
+      "bad_rate_test": 0.0369,
+      "auprc": 0.3906,
+      "auroc": 0.8799
+    },
+    {
+      "test_visit": 4,
+      "n_train": 15120,
+      "n_test": 3780,
+      "bad_rate_test": 0.0378,
+      "auprc": 0.5782,
+      "auroc": 0.9174
+    }
+  ],
+  "mean_auprc": 0.504,
+  "std_auprc": 0.0857,
+  "groupkfold_ref_auprc": 0.518,
+  "generalisation_gap": 0.014
+}

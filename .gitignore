@@ -1,25 +1,37 @@
-# Data (large files — use DVC)
-data/raw/
-*.h5
-*.hdf5
-*.mat
-*.pkl
-
-# Environment
-.env
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.ipynb_checkpoints/
-.DS_Store
-
-# Results (large outputs)
-results/*.json
-!results/bcr_model_thresh2_meta.json
-results/figures/
-
-# Conda
+*.pyd
+.Python
 *.egg-info/
-dist/
-build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# W&B artifacts (offline runs)
 wandb/
+
+# Training artifacts (regenerable, large)
+results/oof_*.npy
+results/bcr_model_*.pkl
+results/bcr_model_*.json
+results/bcr_model_*.cbm
+results/bcr_model_*_meta.json
+results/figures/*.png
+
+# Logs
+logs/
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

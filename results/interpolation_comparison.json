@@ -1,0 +1,7 @@
+{
+  "n_sessions": 10,
+  "avg_mse_corrupt": 74660.40452828784,
+  "avg_mse_spherical": 4171.416808843426,
+  "avg_mse_zero": 32580.800584783934,
+  "bad_channel": "C3"
+}
