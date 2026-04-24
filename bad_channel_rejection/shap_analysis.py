@@ -1,176 +1,178 @@
-"""bad_channel_rejection/shap_analysis.py
-
-SHAP-style analysis on trained BCR XGBoost model.
-Uses XGBoost's native pred_contribs=True to avoid SHAP/XGBoost
-base_score compatibility issues.
-
-Produces beeswarm plot and bar chart of top-20 features.
-
-Run: python -m bad_channel_rejection.shap_analysis
 """
-import os
+bad_channel_rejection/shap_analysis.py
+
+SHAP analysis on the trained BCR model. Supports XGBoost, LightGBM, CatBoost
+via SHAP's TreeExplainer. XGBoost uses native pred_contribs to avoid base_score
+compat issues; others use standard TreeExplainer.
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
+import os
 import tempfile
+from pathlib import Path
+
+import matplotlib
 import numpy as np
 import pandas as pd
-import shap
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import wandb
 from dotenv import load_dotenv
-from xgboost import Booster, DMatrix
 
-from bad_channel_rejection.dataset import build_feature_matrix
-from bad_channel_rejection.features import FeaturePreprocessor
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from . import build_run_tag
+from .dataset import build_feature_matrix
+from .features import FeaturePreprocessor, preprocess_fold
+from .logging_config import setup_logging
+from .models import MODEL_EXT
 
 load_dotenv()
+os.environ.setdefault("WANDB_MODE", "offline")
 
-# Force W&B offline — avoids network timeout on restricted connections
-os.environ["WANDB_MODE"] = "offline"
+logger = setup_logging(__name__)
 
-DATA_PATH        = "data/raw/Bad_channels_for_ML.csv"
-MODEL_PATH       = "results/bcr_model_thresh2.json"
-FIGURES_DIR      = "results/figures"
-RESULTS_DIR      = "results"
-WANDB_PROJECT    = "eeg-bcr"
-MAX_SHAP_SAMPLES = 2000  # subsample for speed on M2
+DATA_PATH = "data/raw/Bad_channels_for_ML.csv"
+FIGURES_DIR = Path("results/figures")
+RESULTS_DIR = Path("results")
+MAX_SHAP_SAMPLES = 2000
 
-os.makedirs(FIGURES_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_patched_booster(model_path: str) -> Booster:
-    """Load XGBoost model and patch base_score for SHAP compatibility.
+def _xgb_shap(model_path: str, X_sub: np.ndarray, feature_names: list[str]):
+    """XGBoost: use native pred_contribs after patching base_score format."""
+    import xgboost as xgb
 
-    XGBoost 2.x stores base_score as '[5E-1]' in the model JSON.
-    SHAP's XGBTreeModelLoader calls float() on that string and crashes.
-    Fix: read the JSON file, strip brackets, write to temp file, reload.
-    save_config/load_config does NOT work — SHAP reads from the model
-    binary, not the runtime config.
-    """
     with open(model_path) as f:
         model_json = json.load(f)
-
     lmp = model_json["learner"]["learner_model_param"]
     raw = lmp.get("base_score", "")
     if isinstance(raw, str) and raw.startswith("[") and raw.endswith("]"):
         lmp["base_score"] = raw.strip("[]")
-        print(f"[shap] Patched base_score: {repr(raw)} → {repr(lmp['base_score'])}")
+        logger.info(f"Patched base_score: {raw!r} -> {lmp['base_score']!r}")
 
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+    with tempfile.NamedTemporaryFile(
+        suffix=".json", delete=False, mode="w"
+    ) as f:
         tmp_path = f.name
         json.dump(model_json, f)
 
-    booster = Booster()
+    booster = xgb.Booster()
     booster.load_model(tmp_path)
     os.unlink(tmp_path)
-    return booster
 
-
-def load_data():
-    """Load + preprocess feature matrix.
-
-    Returns
-    -------
-    X              : np.ndarray  (18900, 138)
-    y              : np.ndarray  (18900,)
-    feature_names  : list[str]   138 post-preprocessing column names
-                     (exact names from preprocessor.feature_names_out_,
-                      so impedance_missing and all survivors are labelled correctly)
-    """
-    X_raw, y, groups, feature_cols, scale_pos_weight = build_feature_matrix(
-        DATA_PATH,
-        save_cols_to="results/feature_columns.json",
-        bad_threshold=2,
-    )
-    preprocessor = FeaturePreprocessor()
-    X = preprocessor.fit_transform(pd.DataFrame(X_raw, columns=feature_cols))
-
-    # Use the preprocessor's own record of surviving column names —
-    # this is the only correct source after drops + VarianceThreshold.
-    feature_names = preprocessor.feature_names_out_
-
-    if isinstance(X, pd.DataFrame):
-        X = X.to_numpy()
-
-    print(f"[shap] X={X.shape}, bad_rate={y.mean():.4f}")
-    print(f"[shap] feature_names count: {len(feature_names)} "
-          f"({'matches X cols ✓' if len(feature_names) == X.shape[1] else 'MISMATCH ✗'})")
-
-    # Confirm impedance_missing survived
-    imp_in_names = any("impedance_missing" in n.lower() for n in feature_names)
-    print(f"[shap] impedance_missing in feature names: {'YES ✓' if imp_in_names else 'NO ✗'}")
-
-    return X, y, feature_names
-
-
-def compute_shap_values_native(
-    booster: Booster, X_sub: np.ndarray, feature_names: list
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute SHAP values using XGBoost native pred_contribs=True.
-
-    Returns
-    -------
-    shap_vals   : (n_samples, n_features)
-    base_values : (n_samples,)
-    """
-    dmatrix = DMatrix(X_sub, feature_names=feature_names)
+    dmatrix = xgb.DMatrix(X_sub, feature_names=feature_names)
     contribs = booster.predict(dmatrix, pred_contribs=True)
-    # Last column is the bias / base value
     return contribs[:, :-1], contribs[:, -1]
 
 
-def main():
+def _generic_shap(model, X_sub: np.ndarray, feature_names: list[str]):
+    """LightGBM / CatBoost: standard TreeExplainer."""
+    import shap
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_sub)
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1] if len(shap_values) == 2 else shap_values[0]
+    base = explainer.expected_value
+    if isinstance(base, (list, np.ndarray)) and len(np.atleast_1d(base)) > 1:
+        base = base[1]
+    return shap_values, np.full(len(X_sub), float(base))
+
+
+def main(
+    label_strategy: str,
+    model_name: str,
+    use_engineered_features: bool = False,
+    use_impedance_interactions: bool = False,
+):
+    import shap
+
+    if use_impedance_interactions:
+        engineering_kwargs = {
+            "use_channel_bad_rate": False,
+            "use_spatial_pruner": False,
+            "use_impedance_interactions": True,
+        }
+        per_fold_mode = True
+    else:
+        engineering_kwargs = None
+        per_fold_mode = use_engineered_features
+
+    tag = build_run_tag(
+        label_strategy,
+        model_name,
+        use_engineered_features=use_engineered_features,
+        use_impedance_interactions=use_impedance_interactions,
+    )
+    model_path = RESULTS_DIR / f"bcr_model_{tag}.{MODEL_EXT[model_name]}"
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model not found: {model_path}. Run train.py first."
+        )
+
     wandb.init(
-        project=WANDB_PROJECT,
-        name="bcr_shap",
-        tags=["shap", "interpretability"],
+        project="eeg-bcr",
+        name=f"bcr_shap_{tag}",
+        tags=["shap", tag],
         settings=wandb.Settings(init_timeout=120),
     )
 
-    # ── Load data + correct feature names ─────────────────────────────────────
-    X, y, feature_names = load_data()
+    out = build_feature_matrix(DATA_PATH, label_strategy=label_strategy)
+    raw_df = pd.DataFrame(out["X"], columns=out["feature_cols"])
+    if per_fold_mode:
+        X, _, feature_names, _, _ = preprocess_fold(
+            raw_df, raw_df, out["y_hard"],
+            channel_labels_tr=out["channel_labels"],
+            channel_labels_va=out["channel_labels"],
+            use_engineered_features=True,
+            engineering_kwargs=engineering_kwargs,
+        )
+    else:
+        prep = FeaturePreprocessor()
+        X = prep.fit_transform(raw_df)
+        feature_names = prep.feature_names_out_
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    booster = load_patched_booster(MODEL_PATH)
-
-    # ── Subsample ─────────────────────────────────────────────────────────────
     rng = np.random.default_rng(42)
     idx = rng.choice(len(X), size=min(MAX_SHAP_SAMPLES, len(X)), replace=False)
     X_sub = X[idx]
 
-    # ── Compute SHAP values ───────────────────────────────────────────────────
-    print(f"[shap] Computing SHAP values for {len(X_sub)} samples...")
-    shap_vals, base_values = compute_shap_values_native(booster, X_sub, feature_names)
-    print(f"[shap] SHAP values shape: {shap_vals.shape}")
+    logger.info(f"Computing SHAP for {len(X_sub)} samples ({model_name})")
+    if model_name == "xgboost":
+        shap_vals, base_values = _xgb_shap(str(model_path), X_sub, feature_names)
+    else:
+        from .models import create_model
+        m = create_model(model_name, scale_pos_weight=1.0).load(model_path)
+        shap_vals, base_values = _generic_shap(m._model, X_sub, feature_names)
 
-    # ── Top-20 by mean |SHAP| ─────────────────────────────────────────────────
     mean_abs_shap = np.abs(shap_vals).mean(axis=0)
-    sorted_idx    = np.argsort(mean_abs_shap)[::-1]
-    top20_idx     = sorted_idx[:20]
-    top20_names   = [feature_names[i] for i in top20_idx]
-    top20_values  = mean_abs_shap[top20_idx]
+    sorted_idx = np.argsort(mean_abs_shap)[::-1]
+    top20_idx = sorted_idx[:20]
+    top20_names = [feature_names[i] for i in top20_idx]
+    top20_values = mean_abs_shap[top20_idx]
 
-    print("\n[shap] Top-20 features by mean |SHAP|:")
+    logger.info("Top-20 features by mean |SHAP|:")
     for rank, (name, val) in enumerate(zip(top20_names, top20_values), 1):
-        flag = " <-- impedance_missing!" if "impedance_missing" in name.lower() else ""
-        print(f"  {rank:2d}. {name:<55} {val:.5f}{flag}")
+        flag = (
+            " <-- impedance_missing"
+            if "impedance_missing" in name.lower() else ""
+        )
+        logger.info(f"  {rank:2d}. {name:<55} {val:.5f}{flag}")
 
-    # Global rank of impedance_missing
     imp_rank = None
     for rank, i in enumerate(sorted_idx, 1):
         if "impedance_missing" in feature_names[i].lower():
             imp_rank = rank
             break
-
     if imp_rank is not None:
-        print(f"\n  ✓ impedance_missing global rank: #{imp_rank}  "
-              f"(in top-10: {'YES' if imp_rank <= 10 else 'NO'})")
-    else:
-        print("\n  ✗ impedance_missing not found — check FeaturePreprocessor output")
+        logger.info(
+            f"impedance_missing rank: #{imp_rank}  "
+            f"(top-10: {'YES' if imp_rank <= 10 else 'NO'})"
+        )
 
-    # ── Plot 1: Beeswarm ──────────────────────────────────────────────────────
     plt.figure(figsize=(10, 7))
     shap.summary_plot(
         shap_vals[:, top20_idx],
@@ -179,51 +181,65 @@ def main():
         show=False,
         max_display=20,
     )
-    beeswarm_path = f"{FIGURES_DIR}/bcr_shap_beeswarm.png"
+    beeswarm_path = FIGURES_DIR / f"bcr_shap_beeswarm_{tag}.png"
     plt.savefig(beeswarm_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"[shap] Beeswarm saved → {beeswarm_path}")
 
-    # ── Plot 2: Bar chart ─────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(9, 6))
-    colors = ["#ffa657" if "impedance" in n.lower() else "#58a6ff"
-              for n in top20_names]
+    colors = [
+        "#ffa657" if "impedance" in n.lower() else "#58a6ff"
+        for n in top20_names
+    ]
     ax.barh(range(len(top20_names)), top20_values, color=colors)
     ax.set_yticks(range(len(top20_names)))
     ax.set_yticklabels(top20_names, fontsize=9)
     ax.invert_yaxis()
     ax.set_xlabel("Mean |SHAP value|")
-    ax.set_title("BCR — Top-20 Features by SHAP Importance\n"
-                 "(orange = impedance features)")
+    ax.set_title(f"BCR — Top-20 Features ({tag})")
     fig.tight_layout()
-    bar_path = f"{FIGURES_DIR}/bcr_shap_bar.png"
+    bar_path = FIGURES_DIR / f"bcr_shap_bar_{tag}.png"
     fig.savefig(bar_path, dpi=150)
     plt.close(fig)
-    print(f"[shap] Bar chart saved → {bar_path}")
 
-    # ── Save CSV ──────────────────────────────────────────────────────────────
     df_top = pd.DataFrame({
-        "rank":          range(1, len(top20_names) + 1),
-        "feature":       top20_names,
+        "rank": range(1, len(top20_names) + 1),
+        "feature": top20_names,
         "mean_abs_shap": top20_values,
-        "is_impedance":  ["impedance" in n.lower() for n in top20_names],
+        "is_impedance": [
+            "impedance" in n.lower() for n in top20_names
+        ],
     })
-    csv_path = f"{RESULTS_DIR}/bcr_shap_top20.csv"
+    csv_path = RESULTS_DIR / f"bcr_shap_top20_{tag}.csv"
     df_top.to_csv(csv_path, index=False)
-    print(f"[shap] Top-20 CSV saved → {csv_path}")
+    logger.info(f"Saved -> {beeswarm_path}, {bar_path}, {csv_path}")
 
-    # ── W&B ───────────────────────────────────────────────────────────────────
     wandb.log({
-        "shap_beeswarm": wandb.Image(beeswarm_path),
-        "shap_bar":      wandb.Image(bar_path),
+        "shap_beeswarm": wandb.Image(str(beeswarm_path)),
+        "shap_bar": wandb.Image(str(bar_path)),
     })
     if imp_rank is not None:
-        wandb.summary["impedance_missing_shap_rank"] = imp_rank
-        wandb.summary["impedance_missing_in_top10"]  = imp_rank <= 10
-
+        wandb.summary["impedance_missing_rank"] = imp_rank
     wandb.finish()
-    print("\n[shap] Done.")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--label-strategy", default="hard_threshold")
+    parser.add_argument("--model", default="xgboost")
+    parser.add_argument(
+        "--use-engineered-features",
+        action="store_true",
+        help="DEPRECATED — explain the _fe model (all three transforms).",
+    )
+    parser.add_argument(
+        "--use-impedance-interactions",
+        action="store_true",
+        help="Explain the _impedance_ix model (impedance interactions only).",
+    )
+    args = parser.parse_args()
+    main(
+        args.label_strategy,
+        args.model,
+        use_engineered_features=args.use_engineered_features,
+        use_impedance_interactions=args.use_impedance_interactions,
+    )

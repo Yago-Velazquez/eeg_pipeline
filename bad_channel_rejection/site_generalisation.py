@@ -1,130 +1,190 @@
 """
 bad_channel_rejection/site_generalisation.py
 
-Leave-one-visit-out evaluation to quantify cross-visit generalisation.
-Trains on 3 visits, tests on the 4th. Rotates through all 4 visits.
-
-Usage:
-    python -m bad_channel_rejection.site_generalisation
+Leave-one-visit-out evaluation. Trains on 3 visits, tests on the 4th.
+Rotates through all 4 visits.
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import warnings
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
-from xgboost import XGBClassifier
 
-from bad_channel_rejection.dataset import (
-    load_bcr_data,
+from . import build_run_tag
+from .dataset import (
     add_missingness_flags,
     impute_and_encode_channels,
+    load_bcr_data,
 )
-from bad_channel_rejection.features import FeaturePreprocessor
+from .features import FeaturePreprocessor, preprocess_fold
+from .label_quality import build_label_artifacts
+from .logging_config import setup_logging
+from .models import create_model
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-BCR_CSV       = "data/raw/Bad_channels_for_ML.csv"
+logger = setup_logging(__name__)
+
+BCR_CSV = "data/raw/Bad_channels_for_ML.csv"
 BAD_THRESHOLD = 2
-
-XGB_PARAMS = dict(
-    n_estimators=500, max_depth=6, learning_rate=0.05,
-    subsample=0.8, colsample_bytree=0.8,
-    eval_metric='aucpr', early_stopping_rounds=30,
-    tree_method='hist', device='cpu', verbosity=0,
-)
+REFERENCE_AUPRC = 0.518
 
 
-def run_leave_one_visit_out():
-    # 1. Load raw data
+def run_leave_one_visit_out(
+    label_strategy: str = "hard_threshold",
+    model_name: str = "xgboost",
+    use_engineered_features: bool = False,
+    use_impedance_interactions: bool = False,
+):
+    if use_impedance_interactions:
+        engineering_kwargs = {
+            "use_channel_bad_rate": False,
+            "use_spatial_pruner": False,
+            "use_impedance_interactions": True,
+        }
+        per_fold_mode = True
+    else:
+        engineering_kwargs = None
+        per_fold_mode = use_engineered_features
+
+    tag = build_run_tag(
+        label_strategy,
+        model_name,
+        use_engineered_features=use_engineered_features,
+        use_impedance_interactions=use_impedance_interactions,
+    )
+
     df = load_bcr_data(BCR_CSV)
     df = add_missingness_flags(df)
 
-    # 2. Load feature column list (saved by dataset.py on Day 8)
     with open("configs/feature_cols.json") as f:
         feature_cols = json.load(f)
 
-    # 3. Unpack tuple — impute_and_encode_channels returns (df, imputer)
     df, _ = impute_and_encode_channels(df, feature_cols)
 
-    # 4. Build labels now that df is a clean DataFrame
-    y = (df['Bad (score)'] >= BAD_THRESHOLD).astype(int).values
+    artifacts = build_label_artifacts(df, strategy=label_strategy)
+    y = artifacts.y_hard
+    channel_labels = df["Channel labels"].astype(str).to_numpy()
+    weights = (
+        artifacts.sample_weights
+        if not np.allclose(artifacts.sample_weights, 1.0)
+        else None
+    )
 
-    visits = sorted(df['visit'].unique())
-    print(f"\nVisits found: {visits}")
-    print(f"\nSubjects per visit:")
+    visits = sorted(df["visit"].unique())
+    logger.info(f"Visits found: {visits}")
     for v in visits:
-        n_subj = df.loc[df['visit'] == v, 'subject_id'].nunique()
-        n_rows  = (df['visit'] == v).sum()
-        bad_r   = y[df['visit'].values == v].mean()
-        print(f"  Visit {v}: {n_subj} subjects, {n_rows} rows, "
-              f"bad_rate={bad_r:.3f}")
-    print()
+        mask = df["visit"].values == v
+        n_subj = df.loc[mask, "subject_id"].nunique()
+        bad_r = y[mask].mean()
+        logger.info(
+            f"  Visit {v}: {n_subj} subjects, {mask.sum()} rows, "
+            f"bad_rate={bad_r:.3f}"
+        )
 
     results = []
     for test_visit in visits:
-        train_mask = (df['visit'] != test_visit).values
-        test_mask  = (df['visit'] == test_visit).values
+        train_mask = (df["visit"] != test_visit).values
+        test_mask = (df["visit"] == test_visit).values
 
         X_train_df = df.loc[train_mask, feature_cols]
-        X_test_df  = df.loc[test_mask,  feature_cols]
-        y_train    = y[train_mask]
-        y_test     = y[test_mask]
+        X_test_df = df.loc[test_mask, feature_cols]
+        y_train = y[train_mask]
+        y_test = y[test_mask]
+        w_train = weights[train_mask] if weights is not None else None
 
         spw_train = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
 
-        # Fit preprocessor on train only — no leakage
-        prep    = FeaturePreprocessor()
-        X_train = prep.fit_transform(X_train_df)
-        X_test  = prep.transform(X_test_df)
+        if per_fold_mode:
+            X_train, X_test, _, _, _ = preprocess_fold(
+                X_train_df, X_test_df, y_train,
+                channel_labels_tr=channel_labels[train_mask],
+                channel_labels_va=channel_labels[test_mask],
+                use_engineered_features=True,
+                engineering_kwargs=engineering_kwargs,
+            )
+        else:
+            prep = FeaturePreprocessor()
+            X_train = prep.fit_transform(X_train_df)
+            X_test = prep.transform(X_test_df)
 
-        model = XGBClassifier(scale_pos_weight=spw_train, **XGB_PARAMS)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_train, y_train)],
-            verbose=False,
-        )
+        model = create_model(model_name, scale_pos_weight=spw_train)
+        model.fit(X_train, y_train, sample_weight=w_train)
 
         y_prob = model.predict_proba(X_test)[:, 1]
-        auprc  = average_precision_score(y_test, y_prob)
-        auroc  = roc_auc_score(y_test, y_prob)
+        auprc = average_precision_score(y_test, y_prob)
+        auroc = roc_auc_score(y_test, y_prob)
 
         results.append({
-            'test_visit':    int(test_visit),
-            'n_train':       int(train_mask.sum()),
-            'n_test':        int(test_mask.sum()),
-            'bad_rate_test': round(float(y_test.mean()), 4),
-            'auprc':         round(auprc, 4),
-            'auroc':         round(auroc, 4),
+            "test_visit": int(test_visit),
+            "n_train": int(train_mask.sum()),
+            "n_test": int(test_mask.sum()),
+            "bad_rate_test": round(float(y_test.mean()), 4),
+            "auprc": round(auprc, 4),
+            "auroc": round(auroc, 4),
         })
-        print(f"Visit {test_visit} held out → AUPRC={auprc:.4f}  "
-              f"AUROC={auroc:.4f}  (n_test={test_mask.sum()}, "
-              f"bad_rate={y_test.mean():.3f})")
+        logger.info(
+            f"Visit {test_visit} held out: AUPRC={auprc:.4f}  "
+            f"AUROC={auroc:.4f}  (bad_rate={y_test.mean():.3f})"
+        )
 
-    # Summary
-    auprc_vals = [r['auprc'] for r in results]
-    print()
-    print(f"Mean AUPRC (LOVO):  {np.mean(auprc_vals):.4f} ± "
-          f"{np.std(auprc_vals):.4f}")
-    print(f"GroupKFold AUPRC:   0.518 ± 0.085  (subject-stratified, reference)")
-    print(f"Generalisation gap: {0.518 - np.mean(auprc_vals):+.4f}  "
-          f"(GroupKFold − LOVO)")
+    auprc_vals = [r["auprc"] for r in results]
+    mean_auprc = float(np.mean(auprc_vals))
+    std_auprc = float(np.std(auprc_vals))
+    gap = REFERENCE_AUPRC - mean_auprc
 
-    # Save JSON for report
+    logger.info(
+        f"\nMean AUPRC (LOVO): {mean_auprc:.4f} ± {std_auprc:.4f}"
+    )
+    logger.info(
+        f"GroupKFold reference:  {REFERENCE_AUPRC:.4f}  "
+        f"(subject-stratified)"
+    )
+    logger.info(f"Generalisation gap: {gap:+.4f}")
+
     out = {
-        'per_visit':             results,
-        'mean_auprc':            round(np.mean(auprc_vals), 4),
-        'std_auprc':             round(np.std(auprc_vals), 4),
-        'groupkfold_ref_auprc':  0.518,
-        'generalisation_gap':    round(0.518 - np.mean(auprc_vals), 4),
+        "label_strategy": label_strategy,
+        "model_name": model_name,
+        "use_engineered_features": use_engineered_features,
+        "use_impedance_interactions": use_impedance_interactions,
+        "tag": tag,
+        "per_visit": results,
+        "mean_auprc": round(mean_auprc, 4),
+        "std_auprc": round(std_auprc, 4),
+        "groupkfold_ref_auprc": REFERENCE_AUPRC,
+        "generalisation_gap": round(gap, 4),
     }
     Path("results").mkdir(exist_ok=True)
-    with open("results/site_generalisation.json", "w") as f:
-        json.dump(out, f, indent=2)
-    print("Saved: results/site_generalisation.json")
+    path = Path(f"results/site_generalisation_{tag}.json")
+    path.write_text(json.dumps(out, indent=2))
+    logger.info(f"Saved: {path}")
     return out
 
 
 if __name__ == "__main__":
-    run_leave_one_visit_out()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--label-strategy", default="hard_threshold")
+    parser.add_argument("--model", default="xgboost")
+    parser.add_argument(
+        "--use-engineered-features",
+        action="store_true",
+        help="DEPRECATED — run LOVO with all three engineered transforms.",
+    )
+    parser.add_argument(
+        "--use-impedance-interactions",
+        action="store_true",
+        help="Run LOVO with ImpedanceInteractionFeatures only.",
+    )
+    args = parser.parse_args()
+    run_leave_one_visit_out(
+        args.label_strategy,
+        args.model,
+        use_engineered_features=args.use_engineered_features,
+        use_impedance_interactions=args.use_impedance_interactions,
+    )

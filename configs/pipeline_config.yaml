@@ -17,12 +17,13 @@ bcr:
   bad_score_threshold: 2
   scale_pos_weight: 24.8
   n_splits: 5
-  decision_threshold: 0.5
+  decision_threshold: 0.35
   primary_metric: auprc
   random_baseline_auprc: 0.039
   mvs_auprc_target: 0.55
-  decision_threshold_argmax_f1: 0.6
+  decision_threshold_argmax_f1: 0.45
   decision_threshold_argmax_2rp: 0.2
+  active_tag: dawid_skene_lightgbm_impedance_ix
 denoiser:
   window: 512
   overlap: 0.5

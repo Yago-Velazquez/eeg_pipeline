@@ -1,203 +1,350 @@
-"""bad_channel_rejection/rater_ablation.py
-
-Rater noise ablation: compare AUPRC trained with all-rater consensus
-vs. consensus excluding Site 3.
-
-Site 3 has r ≈ 0.10 with all other rater sites — we test whether
-its vote degrades label quality.
-
-Run: python -m bad_channel_rejection.rater_ablation
 """
+bad_channel_rejection/rater_ablation.py
+
+Two-stage ablation for BCR.
+
+Stage 1 — LABEL ABLATION (model held constant = XGBoost)
+    All four conditions train XGBoost on the SAME hard binary labels
+    (y = 1[score >= 2] or y = 1[q_i >= 0.5]); they differ only in the
+    per-sample weight scheme passed to `fit(sample_weight=...)`.
+
+    A: hard_threshold     uniform weights (baseline)
+    B: entropy_weights    w = 1 - H(votes) / H_max
+    C: dawid_skene        w = |q_i - 0.5| * 2      (DS hard-confidence)
+    D: dawid_skene_soft   w = P(chosen label|q_i)  (DS full-confidence)
+
+    Winner = argmax(mean OOF AUPRC) across 5 folds.
+
+Stage 2 — MODEL ABLATION (label strategy = Stage 1 winner)
+    X: XGBoost   (baseline)
+    L: LightGBM
+    C: CatBoost
+
+    Winner = argmax(mean OOF AUPRC).
+
+Final recommendation: winning label × winning model.
+
+Why two stages, not a 3x4 grid?
+--------------------------------
+A full grid of 12 conditions gives 12 numbers with overlapping confounds — if
+LightGBM wins on entropy weights but XGBoost wins on DS posteriors, the
+contribution of "label" vs "model" is ambiguous. Sequential ablation isolates
+the effect of each axis. This is the standard controlled-variable design in
+methods papers (e.g., Raschka 2018 on model evaluation).
+
+Run
+---
+    python -m bad_channel_rejection.rater_ablation
+"""
+
+from __future__ import annotations
+
+import json
 import os
+import time
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import wandb
 from dotenv import load_dotenv
-from sklearn.model_selection import GroupKFold
 from sklearn.metrics import average_precision_score, roc_auc_score
-from xgboost import XGBClassifier
+from sklearn.model_selection import GroupKFold
 
-from bad_channel_rejection.dataset import build_feature_matrix, load_bcr_data
-from bad_channel_rejection.features import FeaturePreprocessor
+from .dataset import build_feature_matrix
+from .features import FeaturePreprocessor
+from .logging_config import setup_logging
+from .models import create_model
 
 load_dotenv()
+os.environ.setdefault("WANDB_MODE", "offline")
 
-# Force W&B offline — avoids network timeout on restricted connections
-os.environ["WANDB_MODE"] = "offline"
+logger = setup_logging(__name__)
 
-DATA_PATH     = "data/raw/Bad_channels_for_ML.csv"
-RESULTS_DIR   = "results"
-N_FOLDS       = 5
-RANDOM_STATE  = 42
+DATA_PATH = "data/raw/Bad_channels_for_ML.csv"
+RESULTS_DIR = Path("results")
+N_FOLDS = 5
+RANDOM_STATE = 42
 WANDB_PROJECT = "eeg-bcr"
 
-RATER_COLS_NO_SITE3 = ["Bad (site 2)", "Bad (site 4a)", "Bad (site 4b)"]
+STAGE1_CONDITIONS = [
+    ("A", "hard_threshold", "score>=2, uniform weights (baseline)"),
+    ("B", "entropy_weights", "score>=2, entropy-derived weights"),
+    ("C", "dawid_skene", "q>=0.5 hard + |q-0.5|*2 weights"),
+    ("D", "dawid_skene_soft", "q>=0.5 hard + full-confidence weights"),
+]
 
-XGB_PARAMS = {
-    "n_estimators": 500,
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "eval_metric": "aucpr",
-    "early_stopping_rounds": 30,
-    "device": "cpu",
-    "random_state": RANDOM_STATE,
-    "verbosity": 0,
-}
+STAGE2_MODELS = ["xgboost", "lightgbm", "catboost"]
 
-os.makedirs(RESULTS_DIR, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_features():
-    """Load and preprocess feature matrix. Returns X (np.ndarray), groups, feature_cols."""
-    X_raw, y_all4, groups, feature_cols, scale_pos_weight = build_feature_matrix(
-        DATA_PATH, bad_threshold=2
-    )
-    preprocessor = FeaturePreprocessor()
-    X = preprocessor.fit_transform(pd.DataFrame(X_raw, columns=feature_cols))
-    print(f"[ablation] X={X.shape}, bad_rate={y_all4.mean():.4f}")
-    return X, y_all4, groups, scale_pos_weight
-
-
-def build_targets_no_site3(df: pd.DataFrame) -> np.ndarray:
-    """Recompute bad label using only sites 2, 4a, 4b (excluding site 3).
-    Majority vote of 3 raters: >= 2 out of 3 = bad.
-    """
-    score_no3 = df[RATER_COLS_NO_SITE3].sum(axis=1)
-    y_no3 = (score_no3 >= 2).astype(int)
-    print(f"  No-site3 bad rate: {y_no3.mean():.4f} "
-          f"({y_no3.sum()} bad / {len(y_no3)} total)")
-    return y_no3.values
-
-
-def run_cv(
+def _run_cv(
     X: np.ndarray,
     y: np.ndarray,
     groups: np.ndarray,
-    scale_pos_weight: float,
+    spw: float,
+    model_name: str,
     label: str,
+    sample_weights: np.ndarray | None = None,
 ) -> dict:
+    """Single condition: GroupKFold(5) CV, return mean metrics."""
     gkf = GroupKFold(n_splits=N_FOLDS)
     auprcs, aurocs = [], []
 
-    for fold_idx, (train_idx, val_idx) in enumerate(
+    for fold_idx, (tr_idx, va_idx) in enumerate(
         gkf.split(X, y, groups), start=1
     ):
-        X_tr, y_tr = X[train_idx], y[train_idx]
-        X_val, y_val = X[val_idx], y[val_idx]
-
-        model = XGBClassifier(
-            scale_pos_weight=scale_pos_weight,
-            **XGB_PARAMS
-        )
-        model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
+        X_tr, y_tr = X[tr_idx], y[tr_idx]
+        X_va, y_va = X[va_idx], y[va_idx]
+        w_tr = (
+            sample_weights[tr_idx] if sample_weights is not None else None
         )
 
-        y_prob = model.predict_proba(X_val)[:, 1]
-        auprc = average_precision_score(y_val, y_prob)
-        auroc = roc_auc_score(y_val, y_prob)
+        model = create_model(model_name, scale_pos_weight=spw)
+        model.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=(X_va, y_va))
+
+        y_prob = model.predict_proba(X_va)[:, 1]
+        auprc = average_precision_score(y_va, y_prob)
+        auroc = roc_auc_score(y_va, y_prob)
         auprcs.append(auprc)
         aurocs.append(auroc)
-        print(f"    [{label}] fold {fold_idx}: AUPRC={auprc:.4f}  AUROC={auroc:.4f}")
+        logger.info(
+            f"    [{label}] fold {fold_idx}: "
+            f"AUPRC={auprc:.4f}  AUROC={auroc:.4f}"
+        )
 
     return {
         "label": label,
-        "auprc_mean": np.mean(auprcs),
-        "auprc_std": np.std(auprcs),
-        "auroc_mean": np.mean(aurocs),
-        "auroc_std": np.std(aurocs),
+        "auprc_mean": float(np.mean(auprcs)),
+        "auprc_std": float(np.std(auprcs)),
+        "auroc_mean": float(np.mean(aurocs)),
+        "auroc_std": float(np.std(aurocs)),
     }
 
 
-def _write_report(res_all4: dict, res_no3: dict, delta: float):
-    finding = (
-        "Site 3 **is** degrading label quality (ΔAUPRC > 0.05)."
-        if delta > 0.05
-        else "Site 3 does **not** substantially degrade label quality."
+def run_stage1_label_ablation() -> dict:
+    """Stage 1: iterate over 4 labelling strategies with XGBoost."""
+    logger.info("=" * 60)
+    logger.info("STAGE 1 — LABEL ABLATION (model = XGBoost)")
+    logger.info("=" * 60)
+
+    results = {}
+    for cid, strategy, desc in STAGE1_CONDITIONS:
+        logger.info(f"\n--- Condition {cid} ({strategy}): {desc} ---")
+        out = build_feature_matrix(
+            DATA_PATH, label_strategy=strategy, bad_threshold=2
+        )
+        prep = FeaturePreprocessor()
+        X = prep.fit_transform(
+            pd.DataFrame(out["X"], columns=out["feature_cols"])
+        )
+
+        weights = (
+            out["sample_weights"]
+            if not np.allclose(out["sample_weights"], 1.0)
+            else None
+        )
+
+        r = _run_cv(
+            X,
+            out["y_hard"],
+            out["groups"],
+            out["scale_pos_weight"],
+            model_name="xgboost",
+            label=f"S1_{cid}_{strategy}",
+            sample_weights=weights,
+        )
+        r["condition_id"] = cid
+        r["strategy"] = strategy
+        r["description"] = desc
+        results[cid] = r
+
+    winner_cid = max(results.keys(), key=lambda k: results[k]["auprc_mean"])
+    baseline = results["A"]["auprc_mean"]
+
+    logger.info("\n" + "=" * 60)
+    logger.info("STAGE 1 RESULTS")
+    logger.info("=" * 60)
+    for cid, r in results.items():
+        delta = r["auprc_mean"] - baseline
+        marker = " <-- winner" if cid == winner_cid else ""
+        logger.info(
+            f"  {cid} {r['strategy']:<22}: "
+            f"AUPRC={r['auprc_mean']:.4f} ± {r['auprc_std']:.4f}  "
+            f"Δ={delta:+.4f}{marker}"
+        )
+
+    return {
+        "conditions": results,
+        "winner_condition_id": winner_cid,
+        "winner_strategy": results[winner_cid]["strategy"],
+        "baseline_auprc": baseline,
+    }
+
+
+def run_stage2_model_ablation(winning_strategy: str) -> dict:
+    """Stage 2: iterate over 3 models using the winning label strategy."""
+    logger.info("\n" + "=" * 60)
+    logger.info(
+        f"STAGE 2 — MODEL ABLATION (label strategy = {winning_strategy})"
     )
-    report = f"""# Rater Noise Ablation Report
+    logger.info("=" * 60)
 
-## Setup
-- Feature matrix: fixed (same X for both conditions)
-- Condition A: bad label = Bad (score) >= 2 (all 4 rater sites)
-- Condition B: bad label recomputed from sites 2, 4a, 4b only (site 3 excluded, majority vote >= 2/3)
-- CV: GroupKFold(5) by subject_id
+    out = build_feature_matrix(
+        DATA_PATH, label_strategy=winning_strategy, bad_threshold=2
+    )
+    prep = FeaturePreprocessor()
+    X = prep.fit_transform(
+        pd.DataFrame(out["X"], columns=out["feature_cols"])
+    )
 
-## Results
+    weights = (
+        out["sample_weights"]
+        if not np.allclose(out["sample_weights"], 1.0)
+        else None
+    )
 
-| Condition          | AUPRC mean | AUPRC std | AUROC mean |
-|--------------------|------------|-----------|------------|
-| All 4 raters       | {res_all4['auprc_mean']:.4f}     | {res_all4['auprc_std']:.4f}    | {res_all4['auroc_mean']:.4f}     |
-| No site 3          | {res_no3['auprc_mean']:.4f}     | {res_no3['auprc_std']:.4f}    | {res_no3['auroc_mean']:.4f}     |
-| **ΔAUPRC**         | **{delta:+.4f}**     |           |            |
+    results = {}
+    for model_name in STAGE2_MODELS:
+        logger.info(f"\n--- Model: {model_name} ---")
+        r = _run_cv(
+            X,
+            out["y_hard"],
+            out["groups"],
+            out["scale_pos_weight"],
+            model_name=model_name,
+            label=f"S2_{model_name}",
+            sample_weights=weights,
+        )
+        r["model"] = model_name
+        results[model_name] = r
 
-## Finding
-{finding}
+    winner = max(results.keys(), key=lambda k: results[k]["auprc_mean"])
+    xgb_baseline = results["xgboost"]["auprc_mean"]
 
-Site 3 inter-rater correlation with all other sites: r ≈ 0.10 (confirmed in EDA).
-For context, sites 4a<->4b show r = 0.42. Site 3 is a statistical outlier in rater agreement.
+    logger.info("\n" + "=" * 60)
+    logger.info("STAGE 2 RESULTS")
+    logger.info("=" * 60)
+    for mname, r in results.items():
+        delta = r["auprc_mean"] - xgb_baseline
+        marker = " <-- winner" if mname == winner else ""
+        logger.info(
+            f"  {mname:<10}: AUPRC={r['auprc_mean']:.4f} ± "
+            f"{r['auprc_std']:.4f}  Δvs_xgb={delta:+.4f}{marker}"
+        )
 
-## Interpretation for report
-This is a **methods note**, not a model failure. The label noise ceiling
-limits maximum achievable AUPRC regardless of model quality.
-All primary results use the full consensus score (Condition A) for reproducibility.
-"""
-    path = f"{RESULTS_DIR}/rater_noise_ablation.md"
-    with open(path, "w") as f:
-        f.write(report)
-    print(f"[ablation] Report saved → {path}")
+    return {
+        "conditions": results,
+        "winner_model": winner,
+        "xgboost_baseline_auprc": xgb_baseline,
+    }
+
+
+def write_report(stage1: dict, stage2: dict, out_path: Path):
+    lines = [
+        "# BCR Two-Stage Ablation Report",
+        "",
+        "## Background",
+        "",
+        "Inter-rater reliability analysis on this dataset shows:",
+        "- Krippendorff α = 0.211 (fair agreement)",
+        "- D_o = 6.8% observed pairwise disagreement",
+        "- Site 3 sensitivity (DS) = 0.075 — nearly blind to bad channels",
+        "- Site 4a sensitivity (DS) = 0.714 — most reliable positive detector",
+        "- 493 channels (2.6%) at score=2 represent maximum ambiguity",
+        "",
+        "## Stage 1 — Label ablation (model = XGBoost)",
+        "",
+        "| ID | Strategy | AUPRC (mean ± std) | Δ vs A |",
+        "|----|----------|--------------------|--------|",
+    ]
+    baseline = stage1["baseline_auprc"]
+    for cid, r in stage1["conditions"].items():
+        d = r["auprc_mean"] - baseline
+        dstr = f"{d:+.4f}" if cid != "A" else "—"
+        lines.append(
+            f"| {cid} | {r['strategy']} | "
+            f"{r['auprc_mean']:.4f} ± {r['auprc_std']:.4f} | {dstr} |"
+        )
+    lines.append("")
+    lines.append(
+        f"**Stage 1 winner:** `{stage1['winner_strategy']}` "
+        f"(condition {stage1['winner_condition_id']})"
+    )
+    lines.append("")
+    lines.append(
+        f"## Stage 2 — Model ablation (label = {stage1['winner_strategy']})"
+    )
+    lines.append("")
+    lines.append("| Model | AUPRC (mean ± std) | Δ vs XGBoost |")
+    lines.append("|-------|--------------------|--------------|")
+    xgb_b = stage2["xgboost_baseline_auprc"]
+    for mname, r in stage2["conditions"].items():
+        d = r["auprc_mean"] - xgb_b
+        dstr = f"{d:+.4f}" if mname != "xgboost" else "—"
+        lines.append(
+            f"| {mname} | {r['auprc_mean']:.4f} ± {r['auprc_std']:.4f} | "
+            f"{dstr} |"
+        )
+    lines.append("")
+    lines.append(f"**Stage 2 winner:** `{stage2['winner_model']}`")
+    lines.append("")
+    lines.append("## Recommended production config")
+    lines.append("")
+    lines.append(f"- Label strategy: `{stage1['winner_strategy']}`")
+    lines.append(f"- Model backend : `{stage2['winner_model']}`")
+    lines.append("")
+    lines.append(
+        "Run "
+        f"`python -m bad_channel_rejection.train "
+        f"--label-strategy {stage1['winner_strategy']} "
+        f"--model {stage2['winner_model']}` "
+        "to train the final production model."
+    )
+
+    out_path.write_text("\n".join(lines))
+    logger.info(f"Report saved -> {out_path}")
 
 
 def main():
-    run = wandb.init(
+    wandb.init(
         project=WANDB_PROJECT,
-        name="bcr_rater_ablation",
-        tags=["ablation", "rater_noise"],
+        name="bcr_two_stage_ablation",
+        tags=["ablation", "two_stage"],
         settings=wandb.Settings(init_timeout=120),
     )
+    t0 = time.time()
 
-    # Load feature matrix (X) — same for both conditions
-    X, y_all4, groups, spw_all4 = load_features()
-
-    # Build no-site-3 target from raw dataframe
-    raw_df = load_bcr_data(DATA_PATH)
-    y_no3 = build_targets_no_site3(raw_df)
-    spw_no3 = float((y_no3 == 0).sum() / (y_no3 == 1).sum())
-
-    print(f"\nscale_pos_weight all-4 raters: {spw_all4:.2f}")
-    print(f"scale_pos_weight no-site3:     {spw_no3:.2f}")
-
-    print("\n--- Condition A: all 4 raters ---")
-    res_all4 = run_cv(X, y_all4, groups, spw_all4, "all_raters")
-
-    print("\n--- Condition B: no site 3 ---")
-    res_no3  = run_cv(X, y_no3,  groups, spw_no3,  "no_site3")
-
-    delta = res_no3["auprc_mean"] - res_all4["auprc_mean"]
-
-    print(f"\n=== RATER ABLATION RESULT ===")
-    print(f"  All 4 raters: AUPRC = {res_all4['auprc_mean']:.4f} ± {res_all4['auprc_std']:.4f}")
-    print(f"  No site 3:    AUPRC = {res_no3['auprc_mean']:.4f} ± {res_no3['auprc_std']:.4f}")
-    print(f"  ΔAUPRC = {delta:+.4f}")
-    if delta > 0.05:
-        print("  → Site 3 IS degrading labels (ΔAUPRC > 0.05). Document as label noise finding.")
-    elif delta > 0:
-        print("  → Small positive delta: site 3 adds mild noise but effect is minor.")
-    else:
-        print("  → No improvement: site 3 is not uniquely harmful. Dataset label quality is consistent.")
-
-    # W&B
-    wandb.summary.update({
-        "all_raters_auprc": res_all4["auprc_mean"],
-        "no_site3_auprc":   res_no3["auprc_mean"],
-        "delta_auprc": delta,
-        "site3_degrades_labels": bool(delta > 0.05),
+    stage1 = run_stage1_label_ablation()
+    wandb.log({
+        f"stage1/{cid}/auprc": r["auprc_mean"]
+        for cid, r in stage1["conditions"].items()
     })
-    wandb.finish()
 
-    _write_report(res_all4, res_no3, delta)
+    stage2 = run_stage2_model_ablation(stage1["winner_strategy"])
+    wandb.log({
+        f"stage2/{m}/auprc": r["auprc_mean"]
+        for m, r in stage2["conditions"].items()
+    })
+
+    wandb.summary.update({
+        "stage1_winner": stage1["winner_strategy"],
+        "stage2_winner": stage2["winner_model"],
+        "total_runtime_min": (time.time() - t0) / 60,
+    })
+
+    out = RESULTS_DIR / "ablation_results.json"
+    out.write_text(json.dumps({"stage1": stage1, "stage2": stage2}, indent=2))
+    logger.info(f"Raw results -> {out}")
+
+    write_report(stage1, stage2, RESULTS_DIR / "ablation_report.md")
+
+    wandb.finish()
+    logger.info(
+        f"\nDone. Total runtime: {(time.time()-t0)/60:.1f} min.\n"
+        f"Winner: {stage1['winner_strategy']} × {stage2['winner_model']}"
+    )
 
 
 if __name__ == "__main__":

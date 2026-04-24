@@ -1,0 +1,21 @@
+rank,feature,mean_abs_shap,is_impedance
+1, Correllation with neighbors (1st quartile),0.49005837377252215,False
+2,channel_label_enc,0.3590786837994785,False
+3, Signal-wide ICA (3rd quartile),0.2293605498809357,False
+4, Correllation with neighbors (maximum),0.21445610207627208,False
+5, Signal-wide ICA50 (3rd quartile),0.21428606979869833,False
+6, Window-specific PCA reconstruction correlation (mean),0.17855884035023345,False
+7, Signal-wide ICA (1st quartile),0.1765515899140898,False
+8, Third quartile frequency (std),0.15490775364541906,False
+9, Window-specific PCA reconstruction correlation (1st quartile),0.1351435241453313,False
+10, Standard deviation (mean),0.13429499718958585,False
+11, Low gamma/high gamma ratio (std),0.12180718961516997,False
+12, Window-specific reconstruction correlation (maximum),0.12131137380760763,False
+13, Window-specific PCA reconstruction correlation (median),0.11612236550114784,False
+14, Signal-wide ICA unmixing (1st quartile),0.10602213012547662,False
+15, Signal-wide PCA (3rd quartile),0.10438132341591265,False
+16, Low gamma/high gamma ratio (maximum),0.10078549069815988,False
+17, Signal-wide ICA50 (1st quartile),0.10047131669265537,False
+18, Low gamma/high gamma ratio (1st quartile),0.09393296803780142,False
+19, Global correlation (maximum),0.08838573081836291,False
+20, Window-specific PCA reconstruction correlation (3rd quartile),0.0824206656206722,False

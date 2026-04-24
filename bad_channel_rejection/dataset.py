@@ -1,13 +1,32 @@
 """
-BCR Dataset — load and feature-engineer the bad channel rejection CSV.
+bad_channel_rejection/dataset.py
 
-Responsibilities:
-  - load_bcr_data()              : load CSV, parse Session into subject_id/visit
-  - add_missingness_flags()      : engineer impedance_missing BEFORE imputation
-                                   (visit 3 has 78.3% missing — structured, not random)
-  - impute_and_encode_channels() : median imputation + ordinal channel encoding
-  - build_feature_matrix()       : full pipeline → X, y, groups, feature_cols
+Load and feature-engineer the BCR CSV. Delegates labelling to label_quality.py.
+
+Pipeline
+--------
+  load_bcr_data        -> parse Session into subject_id / visit / site
+  add_missingness_flag -> engineer impedance_missing BEFORE imputation
+  impute_and_encode    -> median-impute floats, ordinal-encode channels
+  build_label_artifacts -> (from label_quality) y_hard, y_soft?, sample_weights
+  build_feature_matrix -> full pipeline producing X, labels, weights, groups
+
+Labelling strategies (selected via `label_strategy` argument). All four
+emit hard binary labels + per-sample weights; they differ only in the
+weight scheme:
+  - "hard_threshold"   : y = 1[score >= 2],       w = 1 (uniform)
+  - "entropy_weights"  : y = 1[score >= 2],       w = 1 - H / H_max
+  - "dawid_skene"      : y = 1[q_i >= 0.5],       w = |q_i - 0.5| * 2
+                         (hard-confidence; w=0 at q=0.5)
+  - "dawid_skene_soft" : y = 1[q_i >= 0.5],       w = P(chosen label | q_i)
+                         (full-confidence; w=0.5 at q=0.5)
+
+`y_soft` (the raw Dawid-Skene posterior q_i) is still exposed on the
+returned dict for both DS strategies — useful for SHAP and inspecting
+raw posteriors — but is never routed to `model.fit()` as a target.
 """
+
+from __future__ import annotations
 
 import json
 import pathlib
@@ -16,14 +35,17 @@ import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
 
+from .label_quality import LabelArtifacts, build_label_artifacts
+from .logging_config import setup_logging
 
-# Columns to exclude from the feature matrix
+logger = setup_logging(__name__)
+
 NON_FEATURE_COLS = [
-    'Session', 'Task', 'Channel labels',
-    'Bad (site 2)', 'Bad (site 3)', 'Bad (site 4a)', 'Bad (site 4b)',
-    'Bad (score)',
-    'Impedance (start)', 'Impedance (end)',
-    'subject_id', 'visit', 'site',
+    "Session", "Task", "Channel labels",
+    "Bad (site 2)", "Bad (site 3)", "Bad (site 4a)", "Bad (site 4b)",
+    "Bad (score)",
+    "Impedance (start)", "Impedance (end)",
+    "subject_id", "visit", "site",
 ]
 
 
@@ -32,176 +54,211 @@ def load_bcr_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
 
     def parse_session(s: str):
-        parts = str(s).split('-')
-        visit      = int(parts[0])
-        subject_id = int(parts[1])
-        site       = int(parts[2])
-        return subject_id, site, visit
+        parts = str(s).split("-")
+        return int(parts[1]), int(parts[2]), int(parts[0])
 
-    parsed = df['Session'].apply(
-        lambda x: pd.Series(parse_session(x),
-                             index=['subject_id', 'site', 'visit'])
+    parsed = df["Session"].apply(
+        lambda x: pd.Series(
+            parse_session(x), index=["subject_id", "site", "visit"]
+        )
     )
     df = pd.concat([parsed, df], axis=1)
 
-    print(f"Loaded:           {df.shape}")
-    print(f"Unique subjects:  {df['subject_id'].nunique()}")    # expect 43
-    print(f"Unique visits:    {sorted(df['visit'].unique())}")  # expect [1,2,3,4]
-    print(f"Unique sites:     {df['site'].nunique()} (constant — will be dropped)")
+    logger.info(f"Loaded data: shape={df.shape}")
+    logger.info(f"Unique subjects: {df['subject_id'].nunique()}")
+    logger.info(f"Unique visits: {sorted(df['visit'].unique())}")
+    logger.info(
+        f"Unique sites: {df['site'].nunique()} (constant — will be dropped)"
+    )
     return df
 
 
 def add_missingness_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add impedance_missing flag BEFORE any imputation.
+    """Add impedance_missing flag BEFORE imputation.
 
-    Visit 3 has 78.3% missing impedance vs 0% for visits 1, 2, 4.
-    This is structured missingness (different measurement protocol),
-    not random — it carries predictive signal and must be preserved
-    as an explicit binary feature.
+    Visit 3 has 78.3% missing impedance vs 0% for visits 1, 2, 4. This is
+    structured missingness that carries predictive signal and must be
+    preserved as an explicit binary feature.
     """
     df = df.copy()
-    df['impedance_missing'] = df['Impedance (start)'].isnull().astype(int)
-
-    visit_miss = df.groupby('visit')['impedance_missing'].mean().round(3)
-    print("\nImpedance missing by visit:\n", visit_miss)
-
+    df["impedance_missing"] = df["Impedance (start)"].isnull().astype(int)
+    visit_miss = df.groupby("visit")["impedance_missing"].mean().round(3)
+    logger.info(f"Impedance missing by visit:\n{visit_miss}")
     return df
 
 
-def impute_and_encode_channels(df: pd.DataFrame,
-                                feature_cols: list):
-    """
-    Median-impute float features, ordinal-encode channel labels by bad rate.
-    impedance_missing stays binary — never impute or log-transform it.
+def impute_and_encode_channels(
+    df: pd.DataFrame, feature_cols: list
+) -> tuple[pd.DataFrame, SimpleImputer]:
+    """Median-impute float features, ordinal-encode channel labels by bad rate.
+
+    impedance_missing stays binary — never imputed or log-transformed.
     inf/-inf values are replaced with NaN before imputation.
     """
     df = df.copy()
 
-    # Ordinal-encode channel labels: rank by descending bad rate
-    # T7, T8 expected near the top from EDA
     channel_order = (
-        df.groupby('Channel labels')['Bad (score)']
+        df.groupby("Channel labels")["Bad (score)"]
         .mean()
         .sort_values(ascending=False)
         .index.tolist()
     )
     channel_map = {ch: i for i, ch in enumerate(channel_order)}
-    df['channel_label_enc'] = df['Channel labels'].map(channel_map)
-    print(f"\nTop-5 channels by bad rate: {channel_order[:5]}")
+    df["channel_label_enc"] = df["Channel labels"].map(channel_map)
+    logger.info(f"Top-5 channels by bad rate: {channel_order[:5]}")
 
-    # Impute float features — exclude impedance_missing and non-numeric
     impute_cols = [
         c for c in feature_cols
-        if c != 'impedance_missing'
-        and df[c].dtype != object
+        if c != "impedance_missing" and df[c].dtype != object
     ]
 
-    # Diagnose inf values before replacing
     inf_cols = [c for c in impute_cols if np.isinf(df[c]).any()]
     if inf_cols:
-        print(f"\nColumns with inf values: {len(inf_cols)} — replacing with NaN")
-        print(f"  First 5: {inf_cols[:5]}")
-
-    # Replace inf/-inf with NaN so median imputer can handle them
+        logger.info(
+            f"Columns with inf values: {len(inf_cols)} — replacing with NaN"
+        )
     df[impute_cols] = df[impute_cols].replace([np.inf, -np.inf], np.nan)
 
-    imp = SimpleImputer(strategy='median')
+    imp = SimpleImputer(strategy="median")
     df[impute_cols] = imp.fit_transform(df[impute_cols])
 
-    all_feature_cols = feature_cols + ['channel_label_enc']
+    all_feature_cols = feature_cols + ["channel_label_enc"]
     remaining_nans = df[all_feature_cols].isnull().sum().sum()
-    assert remaining_nans == 0, f"Still {remaining_nans} NaNs after imputation!"
-    print("✓ Zero NaN/inf values confirmed after imputation")
+    assert remaining_nans == 0, f"Still {remaining_nans} NaNs after imputation"
+    logger.info("Zero NaN/inf values confirmed after imputation")
 
     return df, imp
 
 
-def build_targets_and_groups(df: pd.DataFrame,
-                              bad_threshold: int = 2):
-    """Return y (binary), groups (subject_id), scale_pos_weight."""
-    y = (df['Bad (score)'] >= bad_threshold).astype(int)
-
-    n_neg = (y == 0).sum()
-    n_pos = (y == 1).sum()
-    scale_pos_weight = n_neg / n_pos
-
-    print(f"\nLabel threshold: Bad (score) >= {bad_threshold}")
-    print(f"Class distribution — good: {n_neg}, bad: {n_pos}")
-    print(f"Bad rate: {n_pos / (n_neg + n_pos):.4f}")
-    print(f"scale_pos_weight = {scale_pos_weight:.2f}")
-
-    groups = df['subject_id'].values
-    assert len(np.unique(groups)) == 43, \
-        f"Expected 43 subjects, got {len(np.unique(groups))}"
-
-    return y.values, groups, scale_pos_weight
-
-
-def build_feature_matrix(csv_path: str,
-                          save_cols_to: str = None,
-                          bad_threshold: int = 2):
-    """
-    Full BCR feature matrix pipeline.
-
-    Parameters
-    ----------
-    csv_path      : path to Bad_channels_for_ML.csv
-    save_cols_to  : optional path to save feature column names as JSON
-    bad_threshold : minimum Bad (score) to label a channel as bad.
-                    2 = score>=2 (3.9% bad, scale_pos_weight~24.8)  ← default
-                    1 = score>=1 (12.8% bad, scale_pos_weight~6.8)  ← sensitivity experiment
+def build_targets_and_groups(
+    df: pd.DataFrame,
+    label_strategy: str = "hard_threshold",
+    bad_threshold: int = 2,
+) -> tuple[LabelArtifacts, np.ndarray, float]:
+    """Build labels + weights via the chosen strategy, plus groups and spw.
 
     Returns
     -------
-    X                — np.ndarray (18900, n_features)
-    y                — np.ndarray (18900,) binary labels
-    groups           — np.ndarray (18900,) subject_id for GroupKFold
-    feature_cols     — list of feature column names
-    scale_pos_weight — float
+    artifacts : LabelArtifacts
+        y_hard, optional y_soft, sample_weights, strategy name, metadata.
+    groups : np.ndarray (n,)
+        subject_id for GroupKFold splitting.
+    scale_pos_weight : float
+        n_good / n_bad computed from y_hard. Used by boosting classifiers.
+    """
+    artifacts = build_label_artifacts(
+        df, strategy=label_strategy, threshold=bad_threshold
+    )
+    y = artifacts.y_hard
+    n_neg = int((y == 0).sum())
+    n_pos = int((y == 1).sum())
+    scale_pos_weight = n_neg / max(n_pos, 1)
+
+    logger.info(f"Label strategy: {artifacts.strategy}")
+    logger.info(
+        f"Class distribution — good: {n_neg}, bad: {n_pos}  "
+        f"(bad_rate={n_pos/(n_neg+n_pos):.4f})"
+    )
+    logger.info(f"scale_pos_weight = {scale_pos_weight:.2f}")
+
+    groups = df["subject_id"].values
+    assert len(np.unique(groups)) == 43, (
+        f"Expected 43 subjects, got {len(np.unique(groups))}"
+    )
+
+    return artifacts, groups, scale_pos_weight
+
+
+def build_feature_matrix(
+    csv_path: str,
+    save_cols_to: str | None = None,
+    bad_threshold: int = 2,
+    label_strategy: str = "hard_threshold",
+) -> dict:
+    """Full BCR pipeline.
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to Bad_channels_for_ML.csv.
+    save_cols_to : str or None
+        Optional path to save feature column names as JSON.
+    bad_threshold : int
+        Score threshold for the hard_threshold / entropy_weights strategies.
+    label_strategy : str
+        One of {"hard_threshold", "entropy_weights", "dawid_skene",
+        "dawid_skene_soft"}.
+
+    Returns
+    -------
+    dict with keys:
+        X : np.ndarray (n, n_features)
+        y_hard : np.ndarray (n,) binary
+        y_soft : np.ndarray (n,) or None
+        sample_weights : np.ndarray (n,) float32
+        groups : np.ndarray (n,)
+        channel_labels : np.ndarray (n,) dtype=object  (raw strings)
+        feature_cols : list[str]
+        scale_pos_weight : float
+        label_strategy : str
+        label_metadata : dict
     """
     df = load_bcr_data(csv_path)
-
-    # Step 1: missingness flag BEFORE imputation
     df = add_missingness_flags(df)
 
-    # Step 2: identify numeric feature columns
-    # site is excluded — constant (only 1 site), zero information
     feature_cols = [
         c for c in df.columns
         if c not in NON_FEATURE_COLS
-        and c != 'site'
+        and c != "site"
         and df[c].dtype != object
     ]
 
-    # Step 3: impute + encode channels
-    df, imputer = impute_and_encode_channels(df, feature_cols)
-    feature_cols = feature_cols + ['channel_label_enc']
+    df, _ = impute_and_encode_channels(df, feature_cols)
+    feature_cols = feature_cols + ["channel_label_enc"]
 
-    # Step 4: targets + groups
-    y, groups, scale_pos_weight = build_targets_and_groups(df, bad_threshold)
+    artifacts, groups, spw = build_targets_and_groups(
+        df, label_strategy=label_strategy, bad_threshold=bad_threshold
+    )
 
     X = df[feature_cols].values
+    channel_labels = df["Channel labels"].astype(str).to_numpy()
     assert X.shape[0] == 18900, f"Expected 18900 rows, got {X.shape[0]}"
-    assert not np.isnan(X).any(), "NaN found in feature matrix!"
-    assert not np.isinf(X).any(), "Inf found in feature matrix!"
+    assert len(channel_labels) == X.shape[0]
+    assert not np.isnan(X).any(), "NaN found in feature matrix"
+    assert not np.isinf(X).any(), "Inf found in feature matrix"
 
-    print(f"\n✓ Feature matrix: {X.shape}")
-    print(f"✓ Unique subjects: {len(np.unique(groups))}")
-    print(f"✓ scale_pos_weight: {scale_pos_weight:.2f}")
-    print(f"✓ First 5 features: {feature_cols[:5]}")
+    logger.info(f"Feature matrix shape: {X.shape}")
+    logger.info(f"Unique subjects: {len(np.unique(groups))}")
+    logger.info(f"Unique channel labels: {len(np.unique(channel_labels))}")
 
     if save_cols_to:
         pathlib.Path(save_cols_to).parent.mkdir(parents=True, exist_ok=True)
-        with open(save_cols_to, 'w') as f:
+        with open(save_cols_to, "w") as f:
             json.dump(feature_cols, f, indent=2)
-        print(f"✓ Feature cols saved → {save_cols_to}")
+        logger.info(f"Feature cols saved -> {save_cols_to}")
 
-    return X, y, groups, feature_cols, scale_pos_weight
+    return {
+        "X": X,
+        "y_hard": artifacts.y_hard,
+        "y_soft": artifacts.y_soft,
+        "sample_weights": artifacts.sample_weights,
+        "groups": groups,
+        "channel_labels": channel_labels,
+        "feature_cols": feature_cols,
+        "scale_pos_weight": spw,
+        "label_strategy": artifacts.strategy,
+        "label_metadata": artifacts.metadata or {},
+    }
 
 
-if __name__ == '__main__':
-    X, y, groups, cols, spw = build_feature_matrix(
-        'data/raw/Bad_channels_for_ML.csv',
-        save_cols_to='configs/feature_cols.json'
+if __name__ == "__main__":
+    out = build_feature_matrix(
+        "data/raw/Bad_channels_for_ML.csv",
+        save_cols_to="configs/feature_cols.json",
+        label_strategy="hard_threshold",
+    )
+    logger.info(
+        f"Done. X={out['X'].shape}  "
+        f"strategy={out['label_strategy']}  "
+        f"bad_rate={out['y_hard'].mean():.4f}"
     )

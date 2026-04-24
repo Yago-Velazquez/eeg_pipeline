@@ -47,7 +47,7 @@ def sample_data() -> tuple[pd.DataFrame, np.ndarray, list[str]]:
     Uses build_feature_matrix + FeaturePreprocessor to replicate
     exactly the preprocessing that train.py applied — no shortcuts.
     """
-    X_raw, y, groups, feature_cols, _ = build_feature_matrix(
+    X_raw, y, groups, feature_cols, _, _sw = build_feature_matrix(
         DATA_PATH, bad_threshold=2
     )
     X_df_raw = pd.DataFrame(X_raw, columns=feature_cols)
