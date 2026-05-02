@@ -7,34 +7,35 @@ This module centralises everything related to deriving labels and per-sample
 weights from the 4-rater vote matrix. It replaces the earlier heuristic
 DISAGREEMENT_WEIGHTS map with methods grounded in inter-rater agreement theory.
 
-Four label/weight strategies
-----------------------------
-All four produce the SAME binary targets up to the hard-threshold vs
-Dawid-Skene-posterior choice; they differ only in how per-sample weights
-are computed. This keeps the classifier interface identical across
-conditions (XGBoost cannot consume soft targets).
+Eight label/weight strategies
+------------------------------
+All eight produce the SAME binary targets (hard labels) + per-sample weights.
+They differ in how the latent "true label" posterior is estimated and how
+confidence is converted into a weight. The classifier interface is identical
+across conditions.
 
-  1. hard_threshold       : y = 1[score >= 2], w = 1 (uniform)
-  2. entropy_weights      : y = 1[score >= 2],
-                            w = 1 - H(vote_distribution) / H_max
-                            — score=2 (2v2 split) receives weight 0
-  3. dawid_skene          : y = 1[q_i >= 0.5],
-                            w = |q_i - 0.5| * 2  (hard-confidence;
-                            weight 0 at q=0.5, weight 1 at q in {0, 1})
-  4. dawid_skene_soft     : y = 1[q_i >= 0.5],
-                            w = q_i       if y == 1
-                                1 - q_i   if y == 0
-                            i.e. the posterior probability assigned to the
-                            chosen label. Minimum weight is 0.5 at q=0.5;
-                            samples never drop out entirely.
+  1. hard_threshold    : y = 1[score >= 2], w = 1 (uniform)
+  2. entropy_weights   : y = 1[score >= 2],
+                         w = 1 - H(vote_distribution) / H_max
+                         — score=2 (2v2 split) receives weight 0
+  3. dawid_skene       : y = 1[q_i >= 0.5]  (q from DS EM),
+                         w = |q_i - 0.5| * 2
+  4. dawid_skene_soft  : y = 1[q_i >= 0.5],
+                         w = q_i if y=1, else 1-q_i  (never drops out)
+  5. glad              : y = 1[q_i >= 0.5]  (q from GLAD EM),
+                         w = |q_i - 0.5| * 2
+  6. glad_soft         : same q, w = q_i if y=1, else 1-q_i
+  7. mace              : y = 1[q_i >= 0.5]  (q from MACE EM),
+                         w = |q_i - 0.5| * 2
+  8. mace_soft         : same q, w = q_i if y=1, else 1-q_i
 
-Reference
----------
-Dawid, A.P. & Skene, A.M. (1979). Maximum likelihood estimation of observer
-error-rates using the EM algorithm. Applied Statistics 28(1), 20-28.
-
-The `dawid-skene` package provides a clean implementation; we wrap it so the
-rest of the pipeline does not depend on its exact API.
+References
+----------
+Dawid & Skene (1979). Maximum likelihood estimation of observer error-rates
+  using the EM algorithm. Applied Statistics 28(1), 20-28.
+Whitehill et al. (2009). Whose vote should count more: Optimal integration of
+  labels from annotators of unknown expertise. NeurIPS 22.
+Hovy et al. (2013). Learning whom to trust with MACE. NAACL-HLT.
 """
 
 from __future__ import annotations
@@ -336,6 +337,277 @@ def compute_dawid_skene_labels(
     )
 
 
+def fit_glad(
+    votes: np.ndarray,
+    max_iter: int = 300,
+    tol: float = 1e-4,
+    lr: float = 0.5,
+    beta_clip: float = 5.0,
+) -> tuple[np.ndarray, dict]:
+    """Fit the GLAD model (Whitehill et al. 2009) to a binary vote matrix.
+
+    Each annotator r has a scalar skill β_r; each item i has a scalar
+    easiness α_i.  The probability that annotator r is *correct* on item i
+    is s_ir = σ(β_r · exp(α_i)).  Parameters are estimated via EM.
+
+    Numerical safeguards
+    --------------------
+    - Gradients are normalised by n (for β) and R (for α) so that the
+      learning rate is scale-independent of dataset size.
+    - β is hard-clipped to [-beta_clip, beta_clip] after each update.
+    - α is hard-clipped to [-5, 5] to prevent exp overflow.
+    - Prevalence p is floored at half the empirical bad rate to break the
+      EM feedback loop where p→0 collapses all posteriors to zero. This is
+      equivalent to a mild Dirichlet prior and is necessary for highly
+      imbalanced datasets with near-constant annotators.
+
+    Returns
+    -------
+    posteriors : np.ndarray (n, 2) — columns [P(good), P(bad)]
+    fit_info   : dict with rater skills, convergence info, log-likelihood
+    """
+    _validate_votes(votes)
+    n, R = votes.shape
+
+    empirical_bad_rate = float(votes.mean())
+    p_floor = empirical_bad_rate * 0.5   # prevents p from collapsing to 0
+
+    beta = np.ones(R, dtype=np.float64)    # rater skills
+    alpha = np.zeros(n, dtype=np.float64)  # item easiness
+    p = empirical_bad_rate                 # P(z=1)
+
+    def _sigmoid(x: np.ndarray) -> np.ndarray:
+        return np.where(x >= 0, 1.0 / (1.0 + np.exp(-x)), np.exp(x) / (1.0 + np.exp(x)))
+
+    prev_loglik = -np.inf
+    loglik = -np.inf
+
+    for iteration in range(max_iter):
+        ea = np.exp(np.clip(alpha, -5.0, 5.0))                    # (n,)
+        s = _sigmoid(beta[None, :] * ea[:, None])                  # (n, R)
+
+        log_s = np.log(np.clip(s, 1e-12, 1.0))
+        log_1ms = np.log(np.clip(1.0 - s, 1e-12, 1.0))
+        log_p1 = np.log(p + 1e-12) + (votes * log_s + (1 - votes) * log_1ms).sum(axis=1)
+        log_p0 = np.log(1.0 - p + 1e-12) + ((1 - votes) * log_s + votes * log_1ms).sum(axis=1)
+
+        log_max = np.maximum(log_p1, log_p0)
+        log_Z = log_max + np.log(np.exp(log_p1 - log_max) + np.exp(log_p0 - log_max))
+        q = np.exp(log_p1 - log_Z)
+        loglik = float(log_Z.sum())
+
+        # Floor prevents the EM collapse: p→0 ⟹ q→0 ⟹ p→0 cycle.
+        p = max(float(q.mean()), p_floor)
+
+        agreement = q[:, None] * votes + (1.0 - q[:, None]) * (1.0 - votes)  # (n, R)
+        residual = agreement - s                                               # (n, R)
+
+        # Normalise by n so lr is dataset-size-independent.
+        grad_beta = (ea[:, None] * residual).sum(axis=0) / n
+        grad_alpha = (beta[None, :] * ea[:, None] * residual).sum(axis=1) / R
+
+        beta += lr * grad_beta
+        beta = np.clip(beta, -beta_clip, beta_clip)
+        alpha += lr * grad_alpha
+        alpha = np.clip(alpha, -5.0, 5.0)
+
+        if abs(loglik - prev_loglik) < tol:
+            logger.info(
+                f"GLAD converged after {iteration + 1} iterations "
+                f"(loglik={loglik:.2f})"
+            )
+            break
+        prev_loglik = loglik
+    else:
+        logger.warning(
+            f"GLAD did not converge in {max_iter} iterations; "
+            f"final loglik={loglik:.2f}"
+        )
+
+    posteriors = np.column_stack([1.0 - q, q])
+
+    fit_info = {
+        "rater_skills": {RATER_COLS[r]: float(beta[r]) for r in range(R)},
+        "alpha_mean": float(alpha.mean()),
+        "alpha_std": float(alpha.std()),
+        "n_iterations": iteration + 1,
+        "loglik": loglik,
+    }
+    for r in range(R):
+        logger.info(f"  GLAD {RATER_COLS[r]}: skill β={beta[r]:.3f}")
+
+    return posteriors, fit_info
+
+
+def fit_mace(
+    votes: np.ndarray,
+    max_iter: int = 500,
+    tol: float = 1e-4,
+) -> tuple[np.ndarray, dict]:
+    """Fit the MACE model (Hovy et al. 2013) to a binary vote matrix.
+
+    Each annotator r either "knows" the true label (probability 1-θ_r) or
+    "spams" (probability θ_r), drawing from their personal Bernoulli(ξ_r).
+    The M-step for θ and ξ is analytic; only the E-step requires iteration.
+
+    A tiny annotation-noise term ε = 1e-6 is added so that P(x|T,S=0) is
+    never exactly 0 or 1, keeping the E-step numerically stable.
+
+    Returns
+    -------
+    posteriors : np.ndarray (n, 2) — columns [P(good), P(bad)]
+    fit_info   : dict with per-rater spam rates, strategies, log-likelihood
+    """
+    _validate_votes(votes)
+    n, R = votes.shape
+
+    theta = np.full(R, 0.5)               # P(spamming)
+    xi = votes.mean(axis=0).astype(float)  # P(spam label = 1)
+    p = float(votes.mean())               # P(T=1)
+    eps = 1e-6                             # annotation noise for stability
+
+    prev_loglik = -np.inf
+    loglik = -np.inf
+
+    for iteration in range(max_iter):
+        # P(x_ir | T=t) for t ∈ {0, 1}:
+        #   P(x | T=1) = (1-θ)*[(1-ε)*I(x=1) + ε*I(x=0)] + θ*Bern(x; ξ)
+        #   P(x | T=0) = (1-θ)*[(1-ε)*I(x=0) + ε*I(x=1)] + θ*Bern(x; ξ)
+        spam = xi[None, :] * votes + (1.0 - xi[None, :]) * (1.0 - votes)   # (n, R)
+        know_T1 = votes * (1.0 - eps) + (1.0 - votes) * eps               # (n, R)
+        know_T0 = (1.0 - votes) * (1.0 - eps) + votes * eps               # (n, R)
+        px_T1 = (1.0 - theta[None, :]) * know_T1 + theta[None, :] * spam  # (n, R)
+        px_T0 = (1.0 - theta[None, :]) * know_T0 + theta[None, :] * spam  # (n, R)
+
+        # E-step
+        log_p1 = np.log(p + 1e-12) + np.log(np.clip(px_T1, 1e-12, 1.0)).sum(axis=1)
+        log_p0 = np.log(1.0 - p + 1e-12) + np.log(np.clip(px_T0, 1e-12, 1.0)).sum(axis=1)
+
+        log_max = np.maximum(log_p1, log_p0)
+        log_Z = log_max + np.log(np.exp(log_p1 - log_max) + np.exp(log_p0 - log_max))
+        q = np.exp(log_p1 - log_Z)         # P(T_i = 1 | data), shape (n,)
+        loglik = float(log_Z.sum())
+
+        # M-step
+        p = float(q.mean())
+
+        # E[S_ir | x_ir, T_i] = P(spam | x, T=t) marginalised over T
+        # P(S=1 | x, T=t) = θ * P(x|spam) / P(x|T=t)
+        e_spam_T1 = theta[None, :] * spam / np.clip(px_T1, 1e-12, 1.0)
+        e_spam_T0 = theta[None, :] * spam / np.clip(px_T0, 1e-12, 1.0)
+        e_spam = np.clip(
+            q[:, None] * e_spam_T1 + (1.0 - q[:, None]) * e_spam_T0, 0.0, 1.0
+        )  # (n, R)
+
+        theta = np.clip(e_spam.mean(axis=0), 1e-3, 1.0 - 1e-3)
+        xi = np.clip(
+            (e_spam * votes).sum(axis=0) / (e_spam.sum(axis=0) + 1e-12),
+            1e-6, 1.0 - 1e-6,
+        )
+
+        if abs(loglik - prev_loglik) < tol:
+            logger.info(
+                f"MACE converged after {iteration + 1} iterations "
+                f"(loglik={loglik:.2f})"
+            )
+            break
+        prev_loglik = loglik
+    else:
+        logger.warning(
+            f"MACE did not converge in {max_iter} iterations; "
+            f"final loglik={loglik:.2f}"
+        )
+
+    posteriors = np.column_stack([1.0 - q, q])
+
+    fit_info = {
+        "spam_rates": {RATER_COLS[r]: float(theta[r]) for r in range(R)},
+        "spam_strategies": {RATER_COLS[r]: float(xi[r]) for r in range(R)},
+        "n_iterations": iteration + 1,
+        "loglik": loglik,
+    }
+    for r in range(R):
+        logger.info(
+            f"  MACE {RATER_COLS[r]}: θ={theta[r]:.3f}  ξ={xi[r]:.3f}"
+        )
+
+    return posteriors, fit_info
+
+
+def _posterior_to_artifacts(
+    q_bad: np.ndarray,
+    strategy_hard: str,
+    strategy_soft: str,
+    use_soft_target: bool,
+    fit_info: dict,
+) -> LabelArtifacts:
+    """Convert a posterior P(bad) vector into a LabelArtifacts using the
+    same hard/soft weight scheme as Dawid-Skene.
+
+    Hard  (use_soft_target=False): w = |q - 0.5| * 2
+    Soft  (use_soft_target=True) : w = q if y=1, else 1-q
+    """
+    y_hard = (q_bad >= 0.5).astype(int)
+
+    if use_soft_target:
+        w = np.where(y_hard == 1, q_bad, 1.0 - q_bad).astype(np.float32)
+        strategy = strategy_soft
+    else:
+        w = (np.abs(q_bad - 0.5) * 2.0).astype(np.float32)
+        strategy = strategy_hard
+
+    logger.info(
+        f"{strategy}: bad_rate={y_hard.mean():.4f}  "
+        f"q_mean={q_bad.mean():.4f}  q_median={float(np.median(q_bad)):.4f}"
+    )
+    logger.info(
+        f"  confidence weights: mean={w.mean():.4f}  "
+        f"min={w.min():.4f}  max={w.max():.4f}"
+    )
+
+    return LabelArtifacts(
+        y_hard=y_hard,
+        y_soft=q_bad,
+        sample_weights=w,
+        strategy=strategy,
+        metadata=fit_info,
+    )
+
+
+def compute_glad_labels(
+    votes: np.ndarray,
+    use_soft_target: bool = False,
+) -> LabelArtifacts:
+    """Strategy 5/6: GLAD posteriors → hard labels + confidence weights."""
+    _validate_votes(votes)
+    posteriors, fit_info = fit_glad(votes)
+    q_bad = posteriors[:, 1].astype(np.float32)
+    return _posterior_to_artifacts(
+        q_bad,
+        strategy_hard="glad_hard_confidence",
+        strategy_soft="glad_full_confidence",
+        use_soft_target=use_soft_target,
+        fit_info=fit_info,
+    )
+
+
+def compute_mace_labels(
+    votes: np.ndarray,
+    use_soft_target: bool = False,
+) -> LabelArtifacts:
+    """Strategy 7/8: MACE posteriors → hard labels + confidence weights."""
+    _validate_votes(votes)
+    posteriors, fit_info = fit_mace(votes)
+    q_bad = posteriors[:, 1].astype(np.float32)
+    return _posterior_to_artifacts(
+        q_bad,
+        strategy_hard="mace_hard_confidence",
+        strategy_soft="mace_full_confidence",
+        use_soft_target=use_soft_target,
+        fit_info=fit_info,
+    )
+
+
 def compute_per_rater_reliability(
     df: pd.DataFrame, threshold: int = 2
 ) -> dict:
@@ -352,26 +624,42 @@ def compute_per_rater_reliability(
     return reliability
 
 
+LABEL_STRATEGIES = (
+    "hard_threshold",
+    "entropy_weights",
+    "dawid_skene",
+    "dawid_skene_soft",
+    "glad",
+    "glad_soft",
+    "mace",
+    "mace_soft",
+)
+
+
 def build_label_artifacts(
     df: pd.DataFrame,
-    strategy: Literal[
-        "hard_threshold",
-        "entropy_weights",
-        "dawid_skene",
-        "dawid_skene_soft",
-    ] = "hard_threshold",
+    strategy: str = "hard_threshold",
     threshold: int = 2,
 ) -> LabelArtifacts:
     """Dispatch to the correct strategy. Primary entry point for dataset.py."""
     if strategy == "hard_threshold":
         return compute_hard_threshold_labels(df["Bad (score)"], threshold)
+    votes = df[RATER_COLS].values.astype(int)
     if strategy == "entropy_weights":
-        votes = df[RATER_COLS].values.astype(int)
         return compute_entropy_weights(votes, threshold)
     if strategy == "dawid_skene":
-        votes = df[RATER_COLS].values.astype(int)
         return compute_dawid_skene_labels(votes, use_soft_target=False)
     if strategy == "dawid_skene_soft":
-        votes = df[RATER_COLS].values.astype(int)
         return compute_dawid_skene_labels(votes, use_soft_target=True)
-    raise ValueError(f"Unknown labelling strategy: {strategy!r}")
+    if strategy == "glad":
+        return compute_glad_labels(votes, use_soft_target=False)
+    if strategy == "glad_soft":
+        return compute_glad_labels(votes, use_soft_target=True)
+    if strategy == "mace":
+        return compute_mace_labels(votes, use_soft_target=False)
+    if strategy == "mace_soft":
+        return compute_mace_labels(votes, use_soft_target=True)
+    raise ValueError(
+        f"Unknown labelling strategy: {strategy!r}. "
+        f"Valid options: {LABEL_STRATEGIES}"
+    )

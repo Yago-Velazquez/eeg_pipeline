@@ -1,9 +1,23 @@
 """
 bad_channel_rejection/shap_analysis.py
 
-SHAP analysis on the trained BCR model. Supports XGBoost, LightGBM, CatBoost
-via SHAP's TreeExplainer. XGBoost uses native pred_contribs to avoid base_score
+SHAP analysis on the trained BCR model.  Supports XGBoost, LightGBM, CatBoost
+via SHAP's TreeExplainer.  XGBoost uses native pred_contribs to avoid base_score
 compat issues; others use standard TreeExplainer.
+
+Two modes
+---------
+1. Stage 3 winner (recommended after running ablation_stage3_hpo.py):
+
+       python -m bad_channel_rejection.shap_analysis --from-stage3
+
+   Reads `results/best_config.json` to discover the winning model name and
+   label strategy, then explains `results/best_model.<ext>`.
+
+2. Tagged train.py output (legacy):
+
+       python -m bad_channel_rejection.shap_analysis \\
+           --label-strategy mace --model lightgbm
 """
 
 from __future__ import annotations
@@ -83,36 +97,73 @@ def _generic_shap(model, X_sub: np.ndarray, feature_names: list[str]):
     return shap_values, np.full(len(X_sub), float(base))
 
 
+def _resolve_stage3_inputs() -> tuple[str, str, Path, str]:
+    """Read `results/best_config.json` and return (label_strategy, model_name,
+    model_path, tag) for the Stage 3 HPO winner."""
+    cfg_path = RESULTS_DIR / "best_config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f"{cfg_path} not found. Run Stage 3 HPO first:\n"
+            "  python -m bad_channel_rejection.ablation_stage3_hpo "
+            "--winning-strategy <X> --winning-model <Y> --count 50"
+        )
+    cfg = json.loads(cfg_path.read_text())
+    label_strategy = cfg["winning_strategy"]
+    model_name     = cfg["winning_model"]
+    model_path     = RESULTS_DIR / f"best_model.{MODEL_EXT[model_name]}"
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model not found: {model_path}. Re-run Stage 3 HPO."
+        )
+    return label_strategy, model_name, model_path, "best"
+
+
 def main(
-    label_strategy: str,
-    model_name: str,
+    label_strategy: str | None = None,
+    model_name: str | None = None,
     use_engineered_features: bool = False,
     use_impedance_interactions: bool = False,
+    from_stage3: bool = False,
 ):
     import shap
 
-    if use_impedance_interactions:
-        engineering_kwargs = {
-            "use_channel_bad_rate": False,
-            "use_spatial_pruner": False,
-            "use_impedance_interactions": True,
-        }
-        per_fold_mode = True
-    else:
+    if from_stage3:
+        # Stage 3 winner — discover everything from results/best_config.json.
+        label_strategy, model_name, model_path, tag = _resolve_stage3_inputs()
         engineering_kwargs = None
-        per_fold_mode = use_engineered_features
-
-    tag = build_run_tag(
-        label_strategy,
-        model_name,
-        use_engineered_features=use_engineered_features,
-        use_impedance_interactions=use_impedance_interactions,
-    )
-    model_path = RESULTS_DIR / f"bcr_model_{tag}.{MODEL_EXT[model_name]}"
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model not found: {model_path}. Run train.py first."
+        per_fold_mode = False   # Stage 3 used plain FeaturePreprocessor
+        logger.info(
+            f"Stage 3 mode: explaining {model_name} "
+            f"(label={label_strategy})  model_path={model_path}"
         )
+    else:
+        if label_strategy is None or model_name is None:
+            raise ValueError(
+                "label_strategy and model_name are required when "
+                "from_stage3=False"
+            )
+        if use_impedance_interactions:
+            engineering_kwargs = {
+                "use_channel_bad_rate": False,
+                "use_spatial_pruner": False,
+                "use_impedance_interactions": True,
+            }
+            per_fold_mode = True
+        else:
+            engineering_kwargs = None
+            per_fold_mode = use_engineered_features
+
+        tag = build_run_tag(
+            label_strategy,
+            model_name,
+            use_engineered_features=use_engineered_features,
+            use_impedance_interactions=use_impedance_interactions,
+        )
+        model_path = RESULTS_DIR / f"bcr_model_{tag}.{MODEL_EXT[model_name]}"
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Model not found: {model_path}. Run train.py first."
+            )
 
     wandb.init(
         project="eeg-bcr",
@@ -224,6 +275,12 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--from-stage3",
+        action="store_true",
+        help="Explain the Stage 3 HPO winner (results/best_model.<ext> "
+             "+ results/best_config.json). Overrides --label-strategy / --model.",
+    )
     parser.add_argument("--label-strategy", default="hard_threshold")
     parser.add_argument("--model", default="xgboost")
     parser.add_argument(
@@ -237,9 +294,12 @@ if __name__ == "__main__":
         help="Explain the _impedance_ix model (impedance interactions only).",
     )
     args = parser.parse_args()
-    main(
-        args.label_strategy,
-        args.model,
-        use_engineered_features=args.use_engineered_features,
-        use_impedance_interactions=args.use_impedance_interactions,
-    )
+    if args.from_stage3:
+        main(from_stage3=True)
+    else:
+        main(
+            args.label_strategy,
+            args.model,
+            use_engineered_features=args.use_engineered_features,
+            use_impedance_interactions=args.use_impedance_interactions,
+        )

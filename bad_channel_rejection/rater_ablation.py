@@ -1,249 +1,84 @@
 """
 bad_channel_rejection/rater_ablation.py
 
-Two-stage ablation for BCR.
+Full four-stage ablation + HPO pipeline for BCR.
 
-Stage 1 — LABEL ABLATION (model held constant = XGBoost)
-    All four conditions train XGBoost on the SAME hard binary labels
-    (y = 1[score >= 2] or y = 1[q_i >= 0.5]); they differ only in the
-    per-sample weight scheme passed to `fit(sample_weight=...)`.
+Stage 1  — LABEL ABLATION (model held constant = XGBoost)
+    Conditions A–F differ only in label / weight strategy.
+    Winner = argmax(mean GroupKFold AUPRC).
 
-    A: hard_threshold     uniform weights (baseline)
-    B: entropy_weights    w = 1 - H(votes) / H_max
-    C: dawid_skene        w = |q_i - 0.5| * 2      (DS hard-confidence)
-    D: dawid_skene_soft   w = P(chosen label|q_i)  (DS full-confidence)
+Stage 2a — STRATEGY ABLATION (label held constant = Stage 1 winner)
+    One representative per ML family (linear / bagging / boosting / transformer)
+    on the same fixed folds.
+    Winner = winning ML *family*.
 
-    Winner = argmax(mean OOF AUPRC) across 5 folds.
+Stage 2b — ARCHITECTURE ABLATION (family held constant = Stage 2a winner)
+    Every architecture inside the winning family on the same fixed folds.
+    Winner = winning *architecture*.
 
-Stage 2 — MODEL ABLATION (label strategy = Stage 1 winner)
-    X: XGBoost   (baseline)
-    L: LightGBM
-    C: CatBoost
+Stage 3  — HYPER-PARAMETER OPTIMISATION (architecture held constant = Stage 2b winner)
+    W&B Bayesian sweep across the architecture's hyper-parameter space.
+    Final model retrained on full data and saved.
 
-    Winner = argmax(mean OOF AUPRC).
+Why split Stage 2 in two?
+-------------------------
+Lumping ElasticNet, Random Forest, three boosting libraries and a transformer
+into one ranking confounds two distinct questions:
 
-Final recommendation: winning label × winning model.
+    Q1: which ML *strategy* fits this data?
+    Q2: which *implementation* of that strategy is best?
 
-Why two stages, not a 3x4 grid?
---------------------------------
-A full grid of 12 conditions gives 12 numbers with overlapping confounds — if
-LightGBM wins on entropy weights but XGBoost wins on DS posteriors, the
-contribution of "label" vs "model" is ambiguous. Sequential ablation isolates
-the effect of each axis. This is the standard controlled-variable design in
-methods papers (e.g., Raschka 2018 on model evaluation).
+Stage 2a answers Q1 with one rep per family; Stage 2b answers Q2 within the
+winning family.  This avoids penalising / rewarding a family for having more
+or fewer entries in the bake-off.
 
 Run
 ---
-    python -m bad_channel_rejection.rater_ablation
+    python -m bad_channel_rejection.rater_ablation [--hpo] [--hpo-count N]
+
+For individual stages see:
+    python -m bad_channel_rejection.ablation_stage1_labels         --help
+    python -m bad_channel_rejection.ablation_stage2a_strategies    --help
+    python -m bad_channel_rejection.ablation_stage2b_architectures --help
+    python -m bad_channel_rejection.ablation_stage3_hpo            --help
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import time
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import wandb
 from dotenv import load_dotenv
-from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import GroupKFold
 
-from .dataset import build_feature_matrix
-from .features import FeaturePreprocessor
+from .ablation_stage1_labels import run_stage1_label_ablation
+from .ablation_stage2_models import get_device
+from .ablation_stage2a_strategies import run_stage2a_strategy_ablation
+from .ablation_stage2b_architectures import run_stage2b_architecture_ablation
+from .ablation_stage3_hpo import run_stage3_hpo
 from .logging_config import setup_logging
-from .models import create_model
 
 load_dotenv()
 os.environ.setdefault("WANDB_MODE", "offline")
 
 logger = setup_logging(__name__)
 
-DATA_PATH = "data/raw/Bad_channels_for_ML.csv"
 RESULTS_DIR = Path("results")
-N_FOLDS = 5
-RANDOM_STATE = 42
 WANDB_PROJECT = "eeg-bcr"
 
-STAGE1_CONDITIONS = [
-    ("A", "hard_threshold", "score>=2, uniform weights (baseline)"),
-    ("B", "entropy_weights", "score>=2, entropy-derived weights"),
-    ("C", "dawid_skene", "q>=0.5 hard + |q-0.5|*2 weights"),
-    ("D", "dawid_skene_soft", "q>=0.5 hard + full-confidence weights"),
-]
 
-STAGE2_MODELS = ["xgboost", "lightgbm", "catboost"]
-
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _run_cv(
-    X: np.ndarray,
-    y: np.ndarray,
-    groups: np.ndarray,
-    spw: float,
-    model_name: str,
-    label: str,
-    sample_weights: np.ndarray | None = None,
-) -> dict:
-    """Single condition: GroupKFold(5) CV, return mean metrics."""
-    gkf = GroupKFold(n_splits=N_FOLDS)
-    auprcs, aurocs = [], []
-
-    for fold_idx, (tr_idx, va_idx) in enumerate(
-        gkf.split(X, y, groups), start=1
-    ):
-        X_tr, y_tr = X[tr_idx], y[tr_idx]
-        X_va, y_va = X[va_idx], y[va_idx]
-        w_tr = (
-            sample_weights[tr_idx] if sample_weights is not None else None
-        )
-
-        model = create_model(model_name, scale_pos_weight=spw)
-        model.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=(X_va, y_va))
-
-        y_prob = model.predict_proba(X_va)[:, 1]
-        auprc = average_precision_score(y_va, y_prob)
-        auroc = roc_auc_score(y_va, y_prob)
-        auprcs.append(auprc)
-        aurocs.append(auroc)
-        logger.info(
-            f"    [{label}] fold {fold_idx}: "
-            f"AUPRC={auprc:.4f}  AUROC={auroc:.4f}"
-        )
-
-    return {
-        "label": label,
-        "auprc_mean": float(np.mean(auprcs)),
-        "auprc_std": float(np.std(auprcs)),
-        "auroc_mean": float(np.mean(aurocs)),
-        "auroc_std": float(np.std(aurocs)),
-    }
-
-
-def run_stage1_label_ablation() -> dict:
-    """Stage 1: iterate over 4 labelling strategies with XGBoost."""
-    logger.info("=" * 60)
-    logger.info("STAGE 1 — LABEL ABLATION (model = XGBoost)")
-    logger.info("=" * 60)
-
-    results = {}
-    for cid, strategy, desc in STAGE1_CONDITIONS:
-        logger.info(f"\n--- Condition {cid} ({strategy}): {desc} ---")
-        out = build_feature_matrix(
-            DATA_PATH, label_strategy=strategy, bad_threshold=2
-        )
-        prep = FeaturePreprocessor()
-        X = prep.fit_transform(
-            pd.DataFrame(out["X"], columns=out["feature_cols"])
-        )
-
-        weights = (
-            out["sample_weights"]
-            if not np.allclose(out["sample_weights"], 1.0)
-            else None
-        )
-
-        r = _run_cv(
-            X,
-            out["y_hard"],
-            out["groups"],
-            out["scale_pos_weight"],
-            model_name="xgboost",
-            label=f"S1_{cid}_{strategy}",
-            sample_weights=weights,
-        )
-        r["condition_id"] = cid
-        r["strategy"] = strategy
-        r["description"] = desc
-        results[cid] = r
-
-    winner_cid = max(results.keys(), key=lambda k: results[k]["auprc_mean"])
-    baseline = results["A"]["auprc_mean"]
-
-    logger.info("\n" + "=" * 60)
-    logger.info("STAGE 1 RESULTS")
-    logger.info("=" * 60)
-    for cid, r in results.items():
-        delta = r["auprc_mean"] - baseline
-        marker = " <-- winner" if cid == winner_cid else ""
-        logger.info(
-            f"  {cid} {r['strategy']:<22}: "
-            f"AUPRC={r['auprc_mean']:.4f} ± {r['auprc_std']:.4f}  "
-            f"Δ={delta:+.4f}{marker}"
-        )
-
-    return {
-        "conditions": results,
-        "winner_condition_id": winner_cid,
-        "winner_strategy": results[winner_cid]["strategy"],
-        "baseline_auprc": baseline,
-    }
-
-
-def run_stage2_model_ablation(winning_strategy: str) -> dict:
-    """Stage 2: iterate over 3 models using the winning label strategy."""
-    logger.info("\n" + "=" * 60)
-    logger.info(
-        f"STAGE 2 — MODEL ABLATION (label strategy = {winning_strategy})"
-    )
-    logger.info("=" * 60)
-
-    out = build_feature_matrix(
-        DATA_PATH, label_strategy=winning_strategy, bad_threshold=2
-    )
-    prep = FeaturePreprocessor()
-    X = prep.fit_transform(
-        pd.DataFrame(out["X"], columns=out["feature_cols"])
-    )
-
-    weights = (
-        out["sample_weights"]
-        if not np.allclose(out["sample_weights"], 1.0)
-        else None
-    )
-
-    results = {}
-    for model_name in STAGE2_MODELS:
-        logger.info(f"\n--- Model: {model_name} ---")
-        r = _run_cv(
-            X,
-            out["y_hard"],
-            out["groups"],
-            out["scale_pos_weight"],
-            model_name=model_name,
-            label=f"S2_{model_name}",
-            sample_weights=weights,
-        )
-        r["model"] = model_name
-        results[model_name] = r
-
-    winner = max(results.keys(), key=lambda k: results[k]["auprc_mean"])
-    xgb_baseline = results["xgboost"]["auprc_mean"]
-
-    logger.info("\n" + "=" * 60)
-    logger.info("STAGE 2 RESULTS")
-    logger.info("=" * 60)
-    for mname, r in results.items():
-        delta = r["auprc_mean"] - xgb_baseline
-        marker = " <-- winner" if mname == winner else ""
-        logger.info(
-            f"  {mname:<10}: AUPRC={r['auprc_mean']:.4f} ± "
-            f"{r['auprc_std']:.4f}  Δvs_xgb={delta:+.4f}{marker}"
-        )
-
-    return {
-        "conditions": results,
-        "winner_model": winner,
-        "xgboost_baseline_auprc": xgb_baseline,
-    }
-
-
-def write_report(stage1: dict, stage2: dict, out_path: Path):
+def write_report(
+    stage1: dict,
+    stage2a: dict,
+    stage2b: dict,
+    out_path: Path,
+    stage3: dict | None = None,
+) -> None:
     lines = [
-        "# BCR Two-Stage Ablation Report",
+        "# BCR Four-Stage Ablation Report",
         "",
         "## Background",
         "",
@@ -267,83 +102,208 @@ def write_report(stage1: dict, stage2: dict, out_path: Path):
             f"| {cid} | {r['strategy']} | "
             f"{r['auprc_mean']:.4f} ± {r['auprc_std']:.4f} | {dstr} |"
         )
-    lines.append("")
-    lines.append(
+    lines += [
+        "",
         f"**Stage 1 winner:** `{stage1['winner_strategy']}` "
-        f"(condition {stage1['winner_condition_id']})"
+        f"(condition {stage1['winner_condition_id']})",
+        "",
+        f"## Stage 2a — Strategy ablation "
+        f"(label = {stage1['winner_strategy']})",
+        "",
+        "| Family | Representative | AUPRC (mean ± std) |",
+        "|--------|----------------|--------------------|",
+    ]
+    ranked2a = sorted(
+        stage2a["families"].keys(),
+        key=lambda f: stage2a["families"][f]["auprc_mean"],
+        reverse=True,
     )
-    lines.append("")
-    lines.append(
-        f"## Stage 2 — Model ablation (label = {stage1['winner_strategy']})"
-    )
-    lines.append("")
-    lines.append("| Model | AUPRC (mean ± std) | Δ vs XGBoost |")
-    lines.append("|-------|--------------------|--------------|")
-    xgb_b = stage2["xgboost_baseline_auprc"]
-    for mname, r in stage2["conditions"].items():
-        d = r["auprc_mean"] - xgb_b
-        dstr = f"{d:+.4f}" if mname != "xgboost" else "—"
+    for fam in ranked2a:
+        r = stage2a["families"][fam]
+        marker = " ✓" if fam == stage2a["winner_family"] else ""
         lines.append(
-            f"| {mname} | {r['auprc_mean']:.4f} ± {r['auprc_std']:.4f} | "
-            f"{dstr} |"
+            f"| {fam}{marker} | {r['representative_model']} | "
+            f"{r['auprc_mean']:.4f} ± {r['auprc_std']:.4f} |"
         )
-    lines.append("")
-    lines.append(f"**Stage 2 winner:** `{stage2['winner_model']}`")
-    lines.append("")
-    lines.append("## Recommended production config")
-    lines.append("")
-    lines.append(f"- Label strategy: `{stage1['winner_strategy']}`")
-    lines.append(f"- Model backend : `{stage2['winner_model']}`")
-    lines.append("")
-    lines.append(
-        "Run "
-        f"`python -m bad_channel_rejection.train "
-        f"--label-strategy {stage1['winner_strategy']} "
-        f"--model {stage2['winner_model']}` "
-        "to train the final production model."
+    lines += [
+        "",
+        f"**Stage 2a winning family:** `{stage2a['winner_family']}` "
+        f"(rep: `{stage2a['winner_model_representative']}`)",
+        "",
+        f"## Stage 2b — Architecture ablation "
+        f"(family = {stage2a['winner_family']})",
+        "",
+    ]
+    if stage2b["skipped_comparison"]:
+        lines.append(
+            f"> ℹ️ Family `{stage2a['winner_family']}` has a single member "
+            "— no architecture comparison performed.\n"
+        )
+    lines += [
+        "| Architecture | AUPRC (mean ± std) | Best iter |",
+        "|--------------|--------------------|-----------|",
+    ]
+    ranked2b = sorted(
+        stage2b["conditions"].keys(),
+        key=lambda k: stage2b["conditions"][k]["auprc_mean"],
+        reverse=True,
     )
+    for mname in ranked2b:
+        r = stage2b["conditions"][mname]
+        marker = " ✓" if mname == stage2b["winner_model"] else ""
+        lines.append(
+            f"| {mname}{marker} | "
+            f"{r['auprc_mean']:.4f} ± {r['auprc_std']:.4f} | "
+            f"{r['best_iter_mean']:.0f} |"
+        )
+
+    lines += [
+        "",
+        f"**Stage 2b winning architecture:** `{stage2b['winner_model']}`",
+        "",
+        "## Recommended production configuration",
+        "",
+        f"- Label strategy : `{stage1['winner_strategy']}`",
+        f"- ML family      : `{stage2a['winner_family']}`",
+        f"- Architecture   : `{stage2b['winner_model']}`",
+        "",
+        "Run Stage 3 HPO to optimise the winning configuration:",
+        "",
+        "```",
+        "python -m bad_channel_rejection.ablation_stage3_hpo \\",
+        f"    --winning-strategy {stage1['winner_strategy']} \\",
+        f"    --winning-model {stage2b['winner_model']} \\",
+        "    --count 50",
+        "```",
+    ]
+
+    if stage3 is not None:
+        lines += [
+            "",
+            f"## Stage 3 — HPO ({stage2b['winner_model']})",
+            "",
+            f"Trials: **{stage3['n_trials']}** | "
+            f"W&B sweep: `{stage3['sweep_id']}`",
+            "",
+            "**Best CV AUPRC:** "
+            f"{stage3['best_auprc_mean']:.4f} ± "
+            f"{stage3['best_auprc_std']:.4f}",
+            "",
+            "**Best config:**",
+            "```json",
+            json.dumps(stage3["best_config"], indent=2),
+            "```",
+            "",
+            f"**Final model:** `{stage3['model_path']}`",
+        ]
 
     out_path.write_text("\n".join(lines))
     logger.info(f"Report saved -> {out_path}")
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="BCR full pipeline: stages 1 → 2a → 2b → (optional) 3"
+    )
+    parser.add_argument(
+        "--hpo",
+        action="store_true",
+        help="Run Stage 3 HPO after stages 1, 2a, 2b complete.",
+    )
+    parser.add_argument(
+        "--hpo-count",
+        type=int,
+        default=50,
+        help="Number of W&B sweep trials in Stage 3 (default: 50).",
+    )
+    args = parser.parse_args()
+
+    device = get_device()
+    logger.info(f"Detected device: {device}")
+
     wandb.init(
         project=WANDB_PROJECT,
-        name="bcr_two_stage_ablation",
-        tags=["ablation", "two_stage"],
+        name="bcr_full_pipeline",
+        tags=["ablation", "full_pipeline"],
+        config={"device": device, "hpo": args.hpo},
         settings=wandb.Settings(init_timeout=120),
     )
     t0 = time.time()
 
+    # ── Stage 1 ───────────────────────────────────────────────────────────────
     stage1 = run_stage1_label_ablation()
     wandb.log({
         f"stage1/{cid}/auprc": r["auprc_mean"]
         for cid, r in stage1["conditions"].items()
     })
 
-    stage2 = run_stage2_model_ablation(stage1["winner_strategy"])
+    # ── Stage 2a ──────────────────────────────────────────────────────────────
+    stage2a = run_stage2a_strategy_ablation(
+        winning_strategy=stage1["winner_strategy"], device=device
+    )
     wandb.log({
-        f"stage2/{m}/auprc": r["auprc_mean"]
-        for m, r in stage2["conditions"].items()
+        f"stage2a/{fam}/auprc": r["auprc_mean"]
+        for fam, r in stage2a["families"].items()
     })
+
+    # ── Stage 2b ──────────────────────────────────────────────────────────────
+    stage2b = run_stage2b_architecture_ablation(
+        winning_strategy=stage1["winner_strategy"],
+        winning_family=stage2a["winner_family"],
+        device=device,
+    )
+    wandb.log({
+        f"stage2b/{m}/auprc": r["auprc_mean"]
+        for m, r in stage2b["conditions"].items()
+    })
+
+    # ── Stage 3 (optional) ────────────────────────────────────────────────────
+    stage3: dict | None = None
+    if args.hpo:
+        stage3 = run_stage3_hpo(
+            winning_strategy=stage1["winner_strategy"],
+            winning_model=stage2b["winner_model"],
+            count=args.hpo_count,
+            device=device,
+        )
+        wandb.log({
+            "stage3/best_auprc_mean": stage3["best_auprc_mean"],
+            "stage3/best_auprc_std": stage3["best_auprc_std"],
+            "stage3/n_trials": stage3["n_trials"],
+        })
 
     wandb.summary.update({
         "stage1_winner": stage1["winner_strategy"],
-        "stage2_winner": stage2["winner_model"],
+        "stage2a_winner_family": stage2a["winner_family"],
+        "stage2b_winner_model": stage2b["winner_model"],
+        "stage3_best_auprc": (stage3 or {}).get("best_auprc_mean"),
+        "device": device,
         "total_runtime_min": (time.time() - t0) / 60,
     })
 
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / "ablation_results.json"
-    out.write_text(json.dumps({"stage1": stage1, "stage2": stage2}, indent=2))
+    out.write_text(json.dumps({
+        "stage1":  stage1,
+        "stage2a": stage2a,
+        "stage2b": stage2b,
+        "stage3":  stage3,
+    }, indent=2))
     logger.info(f"Raw results -> {out}")
 
-    write_report(stage1, stage2, RESULTS_DIR / "ablation_report.md")
+    write_report(
+        stage1, stage2a, stage2b,
+        RESULTS_DIR / "ablation_report.md",
+        stage3=stage3,
+    )
 
     wandb.finish()
     logger.info(
         f"\nDone. Total runtime: {(time.time()-t0)/60:.1f} min.\n"
-        f"Winner: {stage1['winner_strategy']} × {stage2['winner_model']}"
+        f"Winner: label={stage1['winner_strategy']} | "
+        f"family={stage2a['winner_family']} | "
+        f"arch={stage2b['winner_model']}"
+        + (f" | hpo_auprc={stage3['best_auprc_mean']:.4f}" if stage3 else "")
     )
 
 

@@ -1,0 +1,137 @@
+{
+  "conditions": {
+    "xgboost": {
+      "label": "S2b_xgboost",
+      "auprc_mean": 0.520303279611684,
+      "auprc_std": 0.08697222358506404,
+      "auroc_mean": 0.9212948912011851,
+      "auroc_std": 0.013052534367738408,
+      "auprc_per_fold": [
+        0.585519524285418,
+        0.4104574952065447,
+        0.43045309682198113,
+        0.540712967779952,
+        0.6343733139645245
+      ],
+      "best_iterations": [
+        174,
+        176,
+        134,
+        179,
+        99
+      ],
+      "best_iter_mean": 152.4,
+      "device": "cpu",
+      "model": "xgboost"
+    },
+    "lightgbm": {
+      "label": "S2b_lightgbm",
+      "auprc_mean": 0.5250379436871658,
+      "auprc_std": 0.09256643473868424,
+      "auroc_mean": 0.9241643440161222,
+      "auroc_std": 0.01198102131673593,
+      "auprc_per_fold": [
+        0.592264499758404,
+        0.40260025336005023,
+        0.44272964443885826,
+        0.534207925893313,
+        0.6533873949852039
+      ],
+      "best_iterations": [
+        238,
+        96,
+        88,
+        97,
+        125
+      ],
+      "best_iter_mean": 128.8,
+      "device": "cpu",
+      "model": "lightgbm"
+    },
+    "catboost": {
+      "label": "S2b_catboost",
+      "auprc_mean": 0.4821615101522362,
+      "auprc_std": 0.104686713688508,
+      "auroc_mean": 0.9225416986550492,
+      "auroc_std": 0.007129807558380924,
+      "auprc_per_fold": [
+        0.5731187080522432,
+        0.3800644521937557,
+        0.36644394988833645,
+        0.4599673182309571,
+        0.6312131223958883
+      ],
+      "best_iterations": [
+        268,
+        144,
+        15,
+        64,
+        106
+      ],
+      "best_iter_mean": 119.4,
+      "device": "cpu",
+      "model": "catboost"
+    },
+    "histgradientboosting": {
+      "label": "S2b_histgradientboosting",
+      "auprc_mean": 0.510772953986423,
+      "auprc_std": 0.09908101432249308,
+      "auroc_mean": 0.9218232558014774,
+      "auroc_std": 0.01403835721370194,
+      "auprc_per_fold": [
+        0.5853863411545611,
+        0.37242466820401926,
+        0.4413773572602781,
+        0.504193762249148,
+        0.6504826410641081
+      ],
+      "best_iterations": [
+        98,
+        103,
+        103,
+        96,
+        86
+      ],
+      "best_iter_mean": 97.2,
+      "device": "cpu",
+      "model": "histgradientboosting"
+    }
+  },
+  "ranked": [
+    "lightgbm",
+    "xgboost",
+    "histgradientboosting",
+    "catboost"
+  ],
+  "winner_model": "lightgbm",
+  "winner_family": "boosting",
+  "winner_cautious": true,
+  "final_cv": {
+    "label": "S2b_lightgbm_final",
+    "auprc_mean": 0.5250379436871658,
+    "auprc_std": 0.09256643473868424,
+    "auroc_mean": 0.9241643440161222,
+    "auroc_std": 0.01198102131673593,
+    "auprc_per_fold": [
+      0.592264499758404,
+      0.40260025336005023,
+      0.44272964443885826,
+      0.534207925893313,
+      0.6533873949852039
+    ],
+    "best_iterations": [
+      238,
+      96,
+      88,
+      97,
+      125
+    ],
+    "best_iter_mean": 128.8,
+    "device": "cpu"
+  },
+  "label_strategy": "mace",
+  "n_members": 4,
+  "skipped_comparison": false,
+  "device": "cpu",
+  "n_folds": 5
+}

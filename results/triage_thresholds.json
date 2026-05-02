@@ -1,0 +1,29 @@
+{
+  "thr_low": 0.014935510172450223,
+  "thr_high": 0.9336452213388265,
+  "auto_bad_precision": 0.8,
+  "auto_good_recall": 0.95,
+  "tier_statistics": {
+    "auto_good": {
+      "n": 12681,
+      "n_bad": 37,
+      "bad_rate": 0.0029,
+      "pct_of_all": 0.671,
+      "pct_of_bads": 0.0505
+    },
+    "review": {
+      "n": 5959,
+      "n_bad": 487,
+      "bad_rate": 0.0817,
+      "pct_of_all": 0.3153,
+      "pct_of_bads": 0.6653
+    },
+    "auto_bad": {
+      "n": 260,
+      "n_bad": 208,
+      "bad_rate": 0.8,
+      "pct_of_all": 0.0138,
+      "pct_of_bads": 0.2842
+    }
+  }
+}

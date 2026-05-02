@@ -11,15 +11,17 @@ Pipeline
   build_label_artifacts -> (from label_quality) y_hard, y_soft?, sample_weights
   build_feature_matrix -> full pipeline producing X, labels, weights, groups
 
-Labelling strategies (selected via `label_strategy` argument). All four
-emit hard binary labels + per-sample weights; they differ only in the
-weight scheme:
-  - "hard_threshold"   : y = 1[score >= 2],       w = 1 (uniform)
-  - "entropy_weights"  : y = 1[score >= 2],       w = 1 - H / H_max
-  - "dawid_skene"      : y = 1[q_i >= 0.5],       w = |q_i - 0.5| * 2
-                         (hard-confidence; w=0 at q=0.5)
-  - "dawid_skene_soft" : y = 1[q_i >= 0.5],       w = P(chosen label | q_i)
-                         (full-confidence; w=0.5 at q=0.5)
+Labelling strategies (selected via `label_strategy` argument). All eight
+emit hard binary labels + per-sample weights; they differ only in how the
+latent-true-label posterior is estimated and how it is converted to a weight:
+  - "hard_threshold"   : y = 1[score >= 2],  w = 1 (uniform)
+  - "entropy_weights"  : y = 1[score >= 2],  w = 1 - H / H_max
+  - "dawid_skene"      : y = 1[q_DS >= 0.5], w = |q - 0.5| * 2
+  - "dawid_skene_soft" : y = 1[q_DS >= 0.5], w = P(chosen label | q)
+  - "glad"             : y = 1[q_GL >= 0.5], w = |q - 0.5| * 2
+  - "glad_soft"        : y = 1[q_GL >= 0.5], w = P(chosen label | q)
+  - "mace"             : y = 1[q_MA >= 0.5], w = |q - 0.5| * 2
+  - "mace_soft"        : y = 1[q_MA >= 0.5], w = P(chosen label | q)
 
 `y_soft` (the raw Dawid-Skene posterior q_i) is still exposed on the
 returned dict for both DS strategies — useful for SHAP and inspecting
@@ -187,7 +189,7 @@ def build_feature_matrix(
         Score threshold for the hard_threshold / entropy_weights strategies.
     label_strategy : str
         One of {"hard_threshold", "entropy_weights", "dawid_skene",
-        "dawid_skene_soft"}.
+        "dawid_skene_soft", "glad", "glad_soft", "mace", "mace_soft"}.
 
     Returns
     -------

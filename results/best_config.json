@@ -1,0 +1,17 @@
+{
+  "winning_strategy": "mace",
+  "winning_model": "lightgbm",
+  "best_config": {
+    "num_leaves": 31,
+    "learning_rate": 0.03718038736102388,
+    "subsample": 0.5298233959146713,
+    "colsample_bytree": 0.7210702069316316,
+    "min_child_samples": 15,
+    "reg_alpha": 0.4571499741016649,
+    "reg_lambda": 0.00037975040647670835
+  },
+  "best_auprc_mean": 0.5405824945324593,
+  "best_auprc_std": 0.08519862589878252,
+  "device": "cpu",
+  "n_folds": 5
+}
